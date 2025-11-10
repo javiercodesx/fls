@@ -1,546 +1,610 @@
-# Explicación Completa del Flujo: `pnpx tsx src/reports/ososs/index.ts ai`
+# Explicación del Flujo Completo: `pnpx tsx src/reports/ososs/index.ts ai s3`
 
-## PARTE 1: ¿Por qué necesitas `loadDrugToIcd10` y lectura dinámica?
-
-### El Problema del Cache de Módulos en Node.js/TypeScript
-
-En Node.js (y por extensión TypeScript compilado), cuando importas un módulo, el código de **nivel superior** (top-level) se ejecuta **UNA SOLA VEZ** cuando el módulo se carga por primera vez. Después, el módulo se cachea y nunca se vuelve a ejecutar ese código de nivel superior.
-
-#### Ejemplo del Problema (ANTES del cambio):
-
-```typescript
-// src/analyses/recipes/drug-diagnosis/index.ts
-
-// ❌ PROBLEMA: Esto se ejecuta UNA SOLA VEZ cuando el módulo se importa por primera vez
-const drugToIcd10: Map<string, Map<string, Category>> = new Map(
-  Array.from(
-    array_categorize([
-      // ... datos del JSON base ...
-      ...readFilesSorted(`${import.meta.dirname}/missing`).map(...)  // ← Se lee UNA VEZ
-    ])
-  )
-);
-
-const scorer: Scorer = (recipes: Recipe[]) => {
-  // Usa drugToIcd10 que fue construido UNA VEZ al inicio
-  const icd10s = drugToIcd10.get(drug);
-  // ...
-}
-```
-
-**¿Qué pasa cuando ejecutas el flujo?**
-
-1. **Primera ejecución de `analyzeUrls()`:**
-   - Node.js importa el módulo `drug-diagnosis/index.ts` por primera vez
-   - Se ejecuta el código de nivel superior: `const drugToIcd10 = ...`
-   - `readFilesSorted()` lee los archivos CSV que existen en ese momento (ej: 7 archivos)
-   - Se construye el Map con esos 7 archivos
-   - El módulo se cachea en memoria
-   - El scorer usa ese Map cacheado
-
-2. **AI procesa y escribe nuevos overrides:**
-   - `writeOverrides()` escribe un nuevo archivo CSV: `20251106203530.csv`
-   - Ahora hay 8 archivos en la carpeta `missing/`
-
-3. **Segunda ejecución de `analyzeUrls()`:**
-   - Node.js **NO vuelve a importar** el módulo (está cacheado)
-   - El código de nivel superior **NO se vuelve a ejecutar**
-   - `drugToIcd10` sigue siendo el mismo Map de la primera ejecución (con solo 7 archivos)
-   - El scorer usa el Map viejo que **NO incluye** el nuevo archivo de AI
-   - ❌ **Los datos de OpenAI NO se usan**
-
-### La Solución: Lectura Dinámica
-
-#### Cómo funciona AHORA (DESPUÉS del cambio):
-
-```typescript
-// ✅ SOLUCIÓN: Esto es una función, NO se ejecuta al importar el módulo
-const loadDrugToIcd10: () => Map<string, Map<string, Category>> = () => {
-  // Esta función se ejecuta CADA VEZ que se llama
-  return new Map(
-    Array.from(
-      array_categorize([
-        // ... datos del JSON base ...
-        ...readFilesSorted(`${import.meta.dirname}/missing`).map(...)  // ← Se lee CADA VEZ
-      ])
-    )
-  );
-};
-
-const scorer: Scorer = (recipes: Recipe[]) => {
-  // ✅ Llama a la función CADA VEZ que se ejecuta el scorer
-  const drugToIcd10 = loadDrugToIcd10();  // ← Lee archivos frescos cada vez
-  const icd10s = drugToIcd10.get(drug);
-  // ...
-}
-```
-
-**¿Qué pasa ahora cuando ejecutas el flujo?**
-
-1. **Primera ejecución de `analyzeUrls()`:**
-   - Node.js importa el módulo (solo define la función, NO la ejecuta)
-   - El scorer se ejecuta y llama `loadDrugToIcd10()`
-   - `readFilesSorted()` lee los archivos CSV actuales (7 archivos)
-   - Se construye el Map con esos 7 archivos
-   - El scorer usa ese Map
-
-2. **AI procesa y escribe nuevos overrides:**
-   - `writeOverrides()` escribe un nuevo archivo CSV: `20251106203530.csv`
-   - Ahora hay 8 archivos en la carpeta `missing/`
-
-3. **Segunda ejecución de `analyzeUrls()`:**
-   - El módulo sigue cacheado (pero eso no importa)
-   - El scorer se ejecuta y llama `loadDrugToIcd10()` **de nuevo**
-   - `readFilesSorted()` lee los archivos CSV **actuales** (8 archivos ahora)
-   - Se construye un Map **nuevo** con los 8 archivos
-   - El scorer usa el Map nuevo que **SÍ incluye** el archivo de AI
-   - ✅ **Los datos de OpenAI SÍ se usan**
-
-### Resumen de la Diferencia
-
-| Aspecto | ANTES (constante) | AHORA (función) |
-|---------|------------------|-----------------|
-| **Cuándo se ejecuta** | Al importar el módulo (una vez) | Cada vez que se llama al scorer |
-| **Cuándo se leen los CSV** | Al inicio del proceso | En cada ejecución del scorer |
-| **¿Lee nuevos archivos?** | ❌ No (cacheado) | ✅ Sí (dinámico) |
-| **¿Usa datos de AI?** | ❌ No | ✅ Sí |
+Este documento explica detalladamente qué sucede cuando se ejecuta el comando `pnpx tsx src/reports/ososs/index.ts ai s3`, desde el análisis inicial hasta la subida a S3.
 
 ---
 
-## PARTE 2: Flujo Completo Paso a Paso
+## 📋 Tabla de Contenidos
 
-### Comando: `pnpx tsx src/reports/ososs/index.ts ai`
+1. [Inicio y Detección de Argumentos](#1-inicio-y-detección-de-argumentos)
+2. [Análisis Inicial de URLs](#2-análisis-inicial-de-urls)
+3. [Procesamiento con IA (si está habilitado)](#3-procesamiento-con-ia-si-está-habilitado)
+4. [Mapeo de Nombres](#4-mapeo-de-nombres)
+5. [Procesamiento por Etapas con OpenAI](#5-procesamiento-por-etapas-con-openai)
+6. [Guardado de Resultados de IA](#6-guardado-de-resultados-de-ia)
+7. [Re-análisis con Datos Enriquecidos](#7-re-análisis-con-datos-enriquecidos)
+8. [Generación de Reportes CSV](#8-generación-de-reportes-csv)
+9. [Compresión en ZIP](#9-compresión-en-zip)
+10. [Subida a S3 (si está habilitado)](#10-subida-a-s3-si-está-habilitado)
 
-### PASO 1: Inicialización del Script
+---
+
+## 1. Inicio y Detección de Argumentos
 
 **Archivo:** `src/reports/ososs/index.ts`
 
-1. **Node.js/TSX carga el módulo:**
-   - Lee el archivo `src/reports/ososs/index.ts`
-   - Ejecuta todos los `import` statements
-   - Carga todos los módulos dependientes (pero NO ejecuta funciones todavía)
-   - Para `drug-diagnosis/index.ts`: Solo define `loadDrugToIcd10` como función (NO la ejecuta)
+Cuando se ejecuta el comando, el script comienza leyendo las URLs desde el archivo de entrada:
 
-2. **Lee configuración:**
-   - `readFileLinesSorted()` lee `src/reports/ososs/in` para obtener las URLs
-   - Crea el `config` Map con los umbrales de scoring
-
-3. **Prepara funciones:**
-   - Define `prepareMissingData()` (no se ejecuta todavía)
-   - Define `writeReport()` (no se ejecuta todavía)
-
-### PASO 2: Primera Ejecución de `analyzeUrls()`
-
-**Línea:** `let analysisResult: AnalysisResult = await analyzeUrls(urls, config);`
-
-**Archivo:** `src/analyses/index.ts`
-
-#### 2.1. Inicialización del Getter
 ```typescript
-const getter: Getter = Getter.createLocal();
-```
-- Crea un Getter que maneja cache local y descargas web
-- Configura rutas de cache
-
-#### 2.2. Obtención de Recetas desde URLs
-```typescript
-const [recipes, missingUrls]: [Recipe[], URL[]] = await fromUrls(getter, urls);
+const urls: string[] = readFileLinesSorted(`${import.meta.dirname}/in`);
 ```
 
-**Archivo:** `src/parsers/index.ts`
+Luego, se llama a `processAnalysis` desde `config.ts`:
 
-**Proceso:**
-1. Para cada URL en `urls`:
-   - El Getter verifica si existe en cache (`cache/api.rcta.me/v1/medicines/...`)
-   - Si existe: lee del cache (rápido)
-   - Si NO existe: descarga de la web y guarda en cache
-   
-2. **Parsing de cada respuesta:**
-   - Detecta el formato (RCTA, OSPSA, etc.)
-   - Llama al parser correspondiente (`src/parsers/rcta/index.ts`, etc.)
-   - Convierte JSON/XML a objetos `Recipe` tipados
-   - Valida estructura y tipos
-
-3. **Resultado:**
-   - `recipes`: Array de objetos `Recipe` parseados
-   - `missingUrls`: URLs que fallaron o no se pudieron parsear
-
-#### 2.3. Ejecución de Todos los Scorers
 ```typescript
-const [recipeResult, missing]: [AnyResult, AnyMissing] = runAllScorers(recipes, config);
+const analysisResult: AnalysisResult = await processAnalysis(urls, config, 'ososs');
 ```
 
-**Archivo:** `src/analyses/recipes/index.ts`
+**Archivo:** `src/reports/config.ts`
 
-**Proceso:**
+En `config.ts`, se detectan los argumentos del comando:
 
-1. **`attachVisitId()`:**
-   - Agrupa recetas por visita (mismo paciente, misma fecha)
-   - Asigna IDs secuenciales a cada visita
+```typescript
+const hasArgument: (pattern: RegExp) => boolean = (pattern: RegExp): boolean =>
+  pattern.test(process.argv.slice(2).join(' '));
 
-2. **Ejecución por Stages (4 stages):**
+const shouldUseAI: () => boolean = (): boolean => hasArgument(/\b(?:openai|ai)\b/iv);
+const shouldUploadToS3: () => boolean = (): boolean => hasArgument(/\bs3\b/iv);
+```
 
-   **Stage 1:**
-   - `diagnosisAge`, `diagnosisSex`, `diagnosisSpecialty`
-   - `dispenseMatchDosage`, `dispenseMatchMonodrug`, `dispenseMatchTherapeuticAction`
-   - `dispenseOptions`, `dispensePrice`, `dispenseUnits`
-   - `drugDiagnosis`, `drugDrug`, `drugOptions`
-   - `drugPrice`, `drugUnits`, `drugSpecialty`
-   - `drugTherapeuticAction`, `drugVademecum`
+- `process.argv.slice(2)` obtiene los argumentos: `['ai', 's3']`
+- `shouldUseAI()` detecta "ai" o "openai" → **true**
+- `shouldUploadToS3()` detecta "s3" → **true**
 
-   **Stage 2:**
-   - `dispenseMatchPrescribedPrice`
-   - `dispenseMatchPrescribedDosage`
+---
 
-   **Stage 3:**
-   - `suspicionPrescribed`
+## 2. Análisis Inicial de URLs
 
-   **Stage 4:**
-   - `suspicionDispensed`
+**Archivo:** `src/reports/config.ts` → `processAnalysis()`
 
-3. **Para cada scorer (ejemplo: `drug-diagnosis`):**
+```typescript
+let analysisResult: AnalysisResult = await analyzeUrls(urls, config);
+```
 
-   **Archivo:** `src/analyses/recipes/drug-diagnosis/index.ts`
+**Archivo:** `src/analyses/index.ts` → `analyzeUrls()`
 
-   a. **Carga de datos:**
+Este proceso realiza:
+
+1. **Parseo de URLs:**
+   - Lee las URLs desde el archivo `src/reports/ososs/in`
+   - Usa `Getter` para obtener las recetas (desde cache o web)
+   - Parsea cada URL y extrae la información de las recetas
+
+2. **Ejecución de Scorers:**
+   - `runAllScorers()` ejecuta todos los scorers en diferentes etapas (stages)
+   - Cada scorer analiza las recetas y genera:
+     - **Resultados:** Metadatos y scores para cada receta
+     - **Missing:** Datos faltantes que no se pudieron encontrar
+
+3. **Estructura de Missing:**
    ```typescript
-   const drugToIcd10 = loadDrugToIcd10();  // ← LEE ARCHIVOS CSV AQUÍ
+   AnyMissing = Map<string, Map<string, unknown[]>>
+   // Ejemplo:
+   // {
+   //   "recipe-id-1": {
+   //     "drug--diagnosis": [{drug: "alprazolam", icd10: "I61"}, ...],
+   //     "drug--specialty": [{drug: "alprazolam", specialty: "medicina"}, ...],
+   //     ...
+   //   },
+   //   ...
+   // }
    ```
-   - Lee el JSON base: `datasets/rcta-to-icd/out/rcta-to-icd.json`
-   - Lee TODOS los CSV en `analyses/recipes/drug-diagnosis/missing/` (ej: 7 archivos)
-   - Combina ambos en un Map: `drug → Map<icd10, score>`
 
-   b. **Procesamiento de cada receta:**
-   - Extrae diagnósticos (ICD10) de la receta
-   - Extrae medicamentos de la receta
-   - Para cada combinación (drug, icd10):
-     - Busca en `drugToIcd10.get(drug)?.get(icd10)`
-     - Si encuentra: marca como resuelto con el score
-     - Si NO encuentra: marca como missing
+4. **Extracción de Datos:**
+   - Extrae datos agregados por paciente, farmacia y médico
+   - Retorna `AnalysisResult` con:
+     - `missing`: Todos los datos faltantes
+     - `missingUrls`: URLs que no se pudieron parsear
+     - `recipes`: Todas las recetas parseadas
+     - `results`: Metadatos agregados
 
-   c. **Resultado:**
-   - `result`: Map con metadata de cada receta (scores, mensajes)
-   - `missing`: Map con pares (drug, icd10) que no se encontraron
+---
 
-4. **Combinación de resultados:**
-   - Combina resultados de todos los scorers
-   - Combina missing de todos los scorers
-   - Retorna `[recipeResult, missing]`
+## 3. Procesamiento con IA (si está habilitado)
 
-#### 2.4. Extracción de Datos por Entidad
+**Archivo:** `src/reports/config.ts` → `processAnalysis()`
+
+Como `shouldUseAI()` retorna `true`, se ejecuta:
+
 ```typescript
-const [physicianResult] = extractData__physician(recipes, recipeResult);
-const [pharmacyResult] = extractData__pharmacy(recipes, recipeResult);
-const [patientResult] = extractData__patient(recipes, recipeResult);
-```
-
-**Proceso:**
-- Agrupa resultados por médico, farmacia, paciente
-- Calcula estadísticas agregadas
-- Crea Maps indexados por ID
-
-#### 2.5. Retorno del Resultado
-```typescript
-return {
-  missing,        // Todos los missing encontrados
-  missingUrls,    // URLs que fallaron
-  recipes,        // Recetas parseadas
-  results: {
-    patient, pharmacy, physician, recipe
-  }
-};
-```
-
-### PASO 3: Preparación de Missing Data para AI
-
-**Línea:** `const missingData: Record<string, string[][]> = prepareMissingData(analysisResult);`
-
-**Archivo:** `src/reports/ososs/index.ts`
-
-#### 3.1. Lectura de Carpetas Disponibles
-```typescript
-const feedbackDataDir = `${import.meta.dirname}/../../feedback/data`;
-const availableFolders = readdirSync(feedbackDataDir, { withFileTypes: true })
-  .filter(dirent => dirent.isDirectory())
-  .map(dirent => dirent.name);
-```
-- Lee qué carpetas existen en `src/feedback/data/`
-- Ejemplo: `['diagnoses', 'drugDiagnosis', 'drugSpecialty']`
-
-#### 3.2. Generación de Reportes Solo para Carpetas Existentes
-```typescript
-for (const folderName of availableFolders) {
-  if (folderName === 'diagnoses') {
-    // Genera reporte especial para diagnoses
-  } else {
-    const generator = getReportGenerator(folderName, analysisResult);
-    if (generator !== undefined) {
-      const report = generator();
-      if (report[0].length > 0) {
-        missingData[folderName] = report[0];
-      }
-    }
-  }
+if (shouldUseAI()) {
+  analysisResult = await processMissingWithAI(analysisResult, clientName, urls, config);
 }
 ```
 
-**Archivo:** `src/reports/generic/missing/reportGenerators.ts`
+### 3.1. Guardado Temporal de Missing
 
-- Para cada carpeta que existe en feedback:
-  - Busca el generador correspondiente
-  - Genera el reporte de missing data
-  - Solo incluye tipos que tienen carpeta en feedback
+**Archivo:** `src/reports/config.ts` → `processMissingWithAI()`
 
-**Resultado:**
+```typescript
+const tempMissingDir: string = `${import.meta.dirname}/${clientName}/out/.temp-missing-${getISOTimestamp()}`;
+mkdirSync(`${tempMissingDir}/missing`, { recursive: true });
+writeMissingReport(`${tempMissingDir}/missing`, analysisResult.missing);
+```
+
+- Crea un directorio temporal: `src/reports/ososs/out/.temp-missing-20251110005613/`
+- `writeMissingReport()` genera archivos CSV por cada tipo de missing:
+  - `drugDiagnosis.csv` (64 entradas)
+  - `drugSpecialty.csv` (16 entradas)
+  - `diagnosisSpecialty.csv` (35 entradas)
+  - Y otros tipos que no tienen configuración de IA
+
+**Archivo:** `src/reports/generic/missing/index.ts`
+
+Cada archivo CSV contiene las combinaciones únicas de datos faltantes. Por ejemplo, `drugDiagnosis.csv`:
+```csv
+"drug";"icd10"
+"alprazolam";"I61"
+"alprazolam";"I63"
+"atorvastatin";"E10"
+...
+```
+
+---
+
+## 4. Mapeo de Nombres
+
+**Archivo:** `src/reports/config.ts`
+
+Hay tres convenciones de nombres diferentes que necesitan mapearse:
+
+### 4.1. Scorer Name (`drug--diagnosis`)
+- Nombre interno usado por los scorers
+- Definido en: `src/analyses/recipes/drug-diagnosis/index.ts`
+- Usado en: `AnyMissing` para identificar qué scorer generó cada missing
+
+### 4.2. Feedback Name (`drugDiagnosis`)
+- Nombre de archivo CSV generado por `writeMissingReport`
+- Nombre de carpeta en `src/feedback/data/` donde están los prompts
+- Usado por `processAllStages` para leer archivos y buscar configuraciones
+
+### 4.3. Scorer Path (`drug-diagnosis`)
+- Nombre de carpeta física donde está el scorer
+- Ruta: `src/analyses/recipes/drug-diagnosis/`
+- Donde se guardan los archivos `missing/` generados por la IA
+
+**Mapeos:**
+```typescript
+const scorerNameToFeedbackName: Map<string, string> = new Map([
+  ['drug--diagnosis', 'drugDiagnosis'],
+  ['drug--specialty', 'drugSpecialty'],
+  ['diagnosis--specialty', 'diagnosisSpecialty'],
+]);
+
+const scorerNameToScorerPath: Map<string, string> = new Map([
+  ['drug--diagnosis', 'drug-diagnosis'],
+  ['drug--specialty', 'drug-specialty'],
+  ['diagnosis--specialty', 'diagnosis-specialty'],
+]);
+```
+
+---
+
+## 5. Procesamiento por Etapas con OpenAI
+
+**Archivo:** `src/reports/config.ts` → `processMissingWithAI()`
+
+```typescript
+const aiResults: Record<string, Record<string, string>[]> = await processAllStages(
+  new OpenAI({ apiKey: getEnv('OPENAI_API_KEY') }),
+  tempMissingDir,
+  1000,
+);
+```
+
+**Archivo:** `src/feedback/index.ts` → `processAllStages()`
+
+### 5.1. Etapa Inicial (`initialStage`)
+
+Lee todos los archivos CSV del directorio temporal y busca configuraciones:
+
+```typescript
+const initialStage = (reportDirectory) => {
+  // Lee: reportDirectory/missing/*.csv
+  // Para cada archivo (ej: drugDiagnosis.csv):
+  //   1. Busca config en: src/feedback/data/drugDiagnosis/config.json
+  //   2. Si existe, lee el CSV y lo convierte a formato interno
+  //   3. Retorna: { drugDiagnosis: {...}, drugSpecialty: {...}, ... }
+}
+```
+
+Solo procesa los tipos que tienen configuración en `src/feedback/data/`.
+
+### 5.2. Procesamiento por Etapas (`processStage`)
+
+Itera por etapas (stage 0, 1, 2, ...) hasta que no haya más etapas:
+
+```typescript
+for (let stage = 0; !done; stage++) {
+  result = await processStage(openAi, stage, result, sleepMs, witness);
+}
+```
+
+**Para cada tipo de missing (ej: `drugDiagnosis`):**
+
+1. **Logging inicial:**
+   ```
+   Processing drugDiagnosis (stage 0) with 64 entries...
+   ```
+
+2. **Carga de configuración:**
+   - Lee `src/feedback/data/drugDiagnosis/config.json`:
+     ```json
+     {
+       "chunkSize": 10,
+       "keySeparator": "|",
+       "resultKeys": ["drug", "icd10", "score"]
+     }
+     ```
+   - Lee prompts:
+     - `src/feedback/data/drugDiagnosis/0.system.txt`
+     - `src/feedback/data/drugDiagnosis/0.user.txt`
+
+3. **División en chunks:**
+   - Divide las 64 entradas en chunks de 10 (chunkSize)
+   - Genera 7 chunks: `[chunk1, chunk2, ..., chunk7]`
+
+4. **Procesamiento de cada chunk:**
+   ```
+   Processing chunk 1/7 for drugDiagnosis...
+   ```
+   
+   - Interpola el prompt con los datos del chunk
+   - Envía a OpenAI (modelo: `gpt-4o-mini`, temperatura: 0.0)
+   - Recibe JSON con resultados:
+     ```json
+     {
+       "alprazolam|I61": "0",
+       "alprazolam|I63": "1",
+       ...
+     }
+     ```
+   - Valida y parsea la respuesta
+   
+   ```
+   Chunk 1/7 for drugDiagnosis complete
+   ```
+   
+   - Espera 1000ms antes del siguiente chunk (rate limiting)
+
+5. **Siguiente etapa (si existe):**
+   - Si hay `1.system.txt` y `1.user.txt`, repite el proceso con los resultados de la etapa anterior
+   - Continúa hasta que no haya más etapas
+
+### 5.3. Formato Final
+
+Al final, `processAllStages` convierte los resultados a arrays de objetos:
+
 ```typescript
 {
   drugDiagnosis: [
-    ['alprazolam', 'I61'],
-    ['atorvastatin', 'E10'],
-    // ... más filas
+    { drug: "alprazolam", icd10: "I61", score: "0" },
+    { drug: "alprazolam", icd10: "I63", score: "1" },
+    ...
   ],
-  drugSpecialty: [
-    ['alprazolam', 'psiquiatria'],
-    // ... más filas
-  ]
+  drugSpecialty: [...],
+  diagnosisSpecialty: [...]
 }
 ```
 
-### PASO 4: Procesamiento con AI
+---
 
-**Línea:** `const reanalyzedResult = await taskRunner.runFromArgv();`
+## 6. Guardado de Resultados de IA
 
-**Archivo:** `src/reports/argv.settings.ts`
+**Archivo:** `src/reports/config.ts` → `processMissingWithAI()`
 
-#### 4.1. Detección de Argumentos
+Después de obtener los resultados de la IA, se guardan en las carpetas `missing/` de cada scorer:
+
 ```typescript
-const argvString = argv.join(' ');
-if (/\b(openai|ai)\b/gi.test(argvString)) {
-  result = await this.runAITask();
+for (const [scorerName, feedbackName] of scorerNameToFeedbackName.entries()) {
+  // scorerName = 'drug--diagnosis'
+  // feedbackName = 'drugDiagnosis'
+  
+  const scorerPath = scorerNameToScorerPath.get(scorerName);
+  // scorerPath = 'drug-diagnosis'
+  
+  const aiResult = aiResults[feedbackName];
+  // aiResults['drugDiagnosis'] = [{drug: "...", icd10: "...", score: "..."}, ...]
+  
+  if (defined(scorerPath) && defined(aiResult) && 0 < aiResult.length) {
+    const scorerMissingDir = `${import.meta.dirname}/../analyses/recipes/${scorerPath}/missing`;
+    // = src/analyses/recipes/drug-diagnosis/missing
+    
+    // Convierte array de objetos a CSV
+    const headers = Object.keys(aiResult[0]);
+    const rows = aiResult.map(record => headers.map(header => record[header]));
+    
+    // Guarda el archivo
+    writeRaw(`${scorerMissingDir}/${getISOTimestamp()}.csv`, rows, headers);
+    // = src/analyses/recipes/drug-diagnosis/missing/20251110005613.csv
+  }
 }
 ```
-- Detecta "ai" o "openai" en los argumentos
-- Llama a `runAITask()`
 
-#### 4.2. Procesamiento con OpenAI
+**Archivos generados:**
+- `src/analyses/recipes/drug-diagnosis/missing/20251110005613.csv`
+- `src/analyses/recipes/drug-specialty/missing/20251110005613.csv`
+- `src/analyses/recipes/diagnosis-specialty/missing/20251110005613.csv`
+
+---
+
+## 7. Re-análisis con Datos Enriquecidos
+
+**Archivo:** `src/reports/config.ts` → `processMissingWithAI()`
+
 ```typescript
-await processMissingData(this.openaiClient, this.missingData, 1000);
+// Re-run analysis with enriched data
+return await analyzeUrls(urls, config);
 ```
 
-**Archivo:** `src/feedback/index.ts`
+Se ejecuta `analyzeUrls` nuevamente, pero esta vez:
 
-**Proceso detallado:**
+### 7.1. Scorers Modificados
 
-1. **`parseMissingData(missingData)`:**
-   - Para cada tipo de missing (ej: `drugDiagnosis`):
-     - Lee `config.json` de `feedback/data/drugDiagnosis/config.json`
-     - Extrae `resultKeys` y `keySeparator`
-     - Convierte filas CSV a Records: `{ "alprazolam|I61": "" }`
-   - Retorna: `{ drugDiagnosis: { "alprazolam|I61": "", ... } }`
+Los scorers fueron modificados para leer archivos `missing/` en tiempo de ejecución:
 
-2. **Loop de Stages (0, 1, 2, ... hasta que no haya más stages):**
+**Archivo:** `src/analyses/recipes/drug-diagnosis/index.ts`
 
-   **Para cada stage:**
-   
-   a. **`processStage(openAi, stage, previous, sleepMs, witness)`:**
-   
-      - Para cada tipo de missing (ej: `drugDiagnosis`):
-      
-        i. **Carga configuración del stage:**
-           - Lee `feedback/data/drugDiagnosis/{stage}.system.txt`
-           - Lee `feedback/data/drugDiagnosis/{stage}.user.txt`
-           - Lee `feedback/data/drugDiagnosis/config.json`
-           - Crea `PromptConfig` con mensajes y configuración
-       
-        ii. **Divide en chunks:**
-           - Divide los records en chunks de tamaño `chunkSize` (ej: 10)
-           - Ejemplo: 64 records → 7 chunks
-       
-        iii. **Para cada chunk:**
-            - Interpola el prompt con los datos del chunk
-            - Llama a OpenAI API: `openai.chat.completions.create()`
-            - Modelo: `gpt-4o-mini`, temperatura: 0.0
-            - Espera respuesta JSON
-            - Valida y parsea la respuesta
-            - Extrae los resultados (ej: `{ "alprazolam|I61": "1" }`)
-            - Espera `sleepMs` (1000ms) entre chunks
-       
-        iv. **Combina resultados:**
-           - Combina resultados de todos los chunks
-           - Actualiza el record con nuevos valores
-           - Si algún chunk procesó, marca `done = false` para continuar
-   
-   b. **Verifica si hay más stages:**
-      - Si `done === false`: hay más stages, continúa
-      - Si `done === true`: no hay más stages, termina
-
-3. **Conversión a formato final:**
-   ```typescript
-   const processedResults = Object.fromEntries(
-     Object.entries(result).map(([name, theResult]) => [
-       name,
-       buildRecords(
-         Object.entries(theResult)
-           .filter(([, value]) => value.length > 0)  // Solo los que tienen respuesta
-           .map(([key, value]) => `${key}${separator}${value}`),
-         config.resultKeys,
-         config.keySeparator
-       )
-     ])
-   );
-   ```
-   - Convierte Records de vuelta a arrays de Records
-   - Ejemplo: `[{ drug: "alprazolam", icd10: "I61", score: "1" }, ...]`
-
-4. **Escritura de Overrides:**
-   ```typescript
-   writeOverrides(processedResults);
-   ```
-
-   **Archivo:** `src/feedback/index.ts`
-   
-   **Proceso:**
-   - Para cada tipo procesado (ej: `drugDiagnosis`):
-     - Genera timestamp: `20251106203530`
-     - Convierte nombre: `drugDiagnosis` → `drug-diagnosis` (camelToSnakeCase)
-     - Ruta: `src/analyses/recipes/drug-diagnosis/missing/20251106203530.csv`
-     - Escribe CSV con headers y filas
-     - **Este archivo ahora existe y será leído en la siguiente ejecución**
-
-#### 4.3. Segunda Ejecución de `analyzeUrls()`
 ```typescript
-return await analyzeUrls(this.urls, this.config);
+const loadDrugToIcd10 = () => {
+  // Lee TODOS los archivos de src/analyses/recipes/drug-diagnosis/missing/
+  // Incluyendo el nuevo archivo generado por la IA
+  return new Map(...readFilesSorted(`${import.meta.dirname}/missing`)...);
+};
+
+const scorer = (recipes) => {
+  // Se recarga cada vez que se ejecuta el scorer
+  const drugToIcd10Runtime = loadDrugToIcd10();
+  
+  // Usa los datos enriquecidos para evaluar las recetas
+  // Si encuentra una combinación drug+icd10 en los archivos missing,
+  // ya no la marca como "missing"
+}
 ```
 
-**IMPORTANTE:** Esta es la segunda vez que se ejecuta `analyzeUrls()`
+### 7.2. Resultado del Re-análisis
 
-**Proceso (similar al PASO 2, pero con diferencias clave):**
+El nuevo `AnalysisResult` tiene:
+- **Menos missing:** Los datos generados por la IA ahora están disponibles
+- **Más resultados:** Más recetas tienen scores completos
+- **Misma estructura:** Pero con datos más completos
 
-1. **Getter y URLs:**
-   - Usa cache (más rápido)
-   - Obtiene las mismas recetas
+---
 
-2. **Ejecución de Scorers:**
-   - **AQUÍ ES DONDE CAMBIA:**
-   
-   **Para `drug-diagnosis` scorer:**
-   ```typescript
-   const drugToIcd10 = loadDrugToIcd10();  // ← SE EJECUTA DE NUEVO
-   ```
-   
-   - `readFilesSorted()` lee la carpeta `missing/` **DE NUEVO**
-   - Ahora encuentra **8 archivos** (7 anteriores + 1 nuevo de AI)
-   - Construye el Map con **TODOS** los 8 archivos
-   - El nuevo archivo `20251106203530.csv` contiene los datos de AI
-   - Cuando busca `drugToIcd10.get("alprazolam")?.get("I61")`, ahora encuentra el score de AI
-   - **Resultado: Menos missing, más pares resueltos**
-
-3. **Resultado:**
-   - `missing`: Ahora tiene MENOS elementos (los que AI resolvió ya no están)
-   - `recipeResult`: Tiene más pares resueltos con scores de AI
-
-### PASO 5: Escritura de Reportes Finales
-
-**Línea:** `writeReport(reportBaseDir, analysisResult);`
+## 8. Generación de Reportes CSV
 
 **Archivo:** `src/reports/ososs/index.ts`
 
-**Proceso:**
+Con el `analysisResult` enriquecido, se generan todos los reportes CSV:
 
-1. **Crea directorio de salida:**
-   ```typescript
-   const timestamp = getISOTimestamp();  // "20251106201612"
-   const reportBaseDir = `${import.meta.dirname}/out/${timestamp}`;
-   mkdirSync(`${reportBaseDir}/missing`, { recursive: true });
+### 8.1. Reportes de Missing
+
+```typescript
+writeRaw(`${reportBaseDir}/missing/urls.csv`, ...);
+writeRaw(`${reportBaseDir}/missing/diagnoses.csv`, ...);
+writeMissingReport(`${reportBaseDir}/missing`, analysisResult.missing);
+```
+
+### 8.2. Reportes Principales
+
+```typescript
+writeRaw(`${reportBaseDir}/recipes.csv`, ...);
+writeRaw(`${reportBaseDir}/billing.csv`, ...);
+writeRaw(`${reportBaseDir}/stock.csv`, ...);
+```
+
+### 8.3. Reportes por Entidad
+
+- **Pacientes:** `patientDrugs.csv`, `patientLaboratories.csv`, `patientProducts.csv`, `patientPharmacies.csv`, `patientTotals.csv`
+- **Médicos:** `physicianDrugs.csv`, `physicianLaboratories.csv`, `physicianProducts.csv`, `physicianPharmacies.csv`, `physicianTotals.csv`
+- **Farmacias:** `pharmacyDrugs.csv`, `pharmacyLaboratories.csv`, `pharmacyProducts.csv`, `pharmacyPharmacies.csv`, `pharmacyTotals.csv`
+
+**Directorio generado:**
+```
+src/reports/ososs/out/20251110005617/
+├── missing/
+│   ├── urls.csv
+│   ├── diagnoses.csv
+│   ├── drugDiagnosis.csv
+│   └── ...
+├── recipes.csv
+├── billing.csv
+├── stock.csv
+├── patientDrugs.csv
+└── ... (17 archivos CSV en total)
+```
+
+---
+
+## 9. Compresión en ZIP
+
+**Archivo:** `src/reports/ososs/index.ts`
+
+```typescript
+await zip(
+  reportBaseDir,
+  `${import.meta.dirname}/out/ososs-${timestamp}.zip`,
+  { compression: COMPRESSION_LEVEL.high }
+);
+```
+
+- Comprime todo el directorio `20251110005617/` en un archivo ZIP
+- Archivo generado: `src/reports/ososs/out/ososs-20251110005617.zip`
+
+---
+
+## 10. Subida a S3 (si está habilitado)
+
+**Archivo:** `src/reports/ososs/index.ts`
+
+Como `shouldUploadToS3()` retorna `true`, se ejecuta:
+
+```typescript
+if (shouldUploadToS3()) {
+  await uploadReportToS3(reportBaseDir, 'ososs');
+}
+```
+
+**Archivo:** `src/reports/config.ts` → `uploadReportToS3()`
+
+```typescript
+const s3Client: S3Client = defaultS3Client();
+const s3Prefix: string = getEnv('AWS_S3_BUCKET_NAME').replaceAll(/\/+$/gv, '');
+
+await Promise.all([
+  uploadToS3(
+    s3Client,
+    `${s3Prefix}/billing--ososs.csv`,
+    readFileSync(`${reportBaseDir}/billing.csv`)
+  ),
+  uploadToS3(
+    s3Client,
+    `${s3Prefix}/recipes--ososs.csv`,
+    readFileSync(`${reportBaseDir}/recipes.csv`)
+  ),
+]);
+```
+
+**Proceso:**
+1. Crea cliente S3 con credenciales de las variables de entorno
+2. Lee `billing.csv` y `recipes.csv` del directorio del reporte
+3. Sube ambos archivos a S3 en paralelo:
+   - `s3://bucket-name/billing--ososs.csv`
+   - `s3://bucket-name/recipes--ososs.csv`
+
+---
+
+## 📊 Resumen del Flujo Completo
+
+```
+1. Ejecución: pnpx tsx src/reports/ososs/index.ts ai s3
+   ↓
+2. Detección de argumentos: ai=true, s3=true
+   ↓
+3. Análisis inicial: analyzeUrls() → identifica missing
+   ↓
+4. Procesamiento con IA:
+   ├─ Guarda missing en directorio temporal
+   ├─ processAllStages() procesa con OpenAI
+   ├─ Guarda resultados en carpetas missing/ de scorers
+   └─ Re-ejecuta analyzeUrls() con datos enriquecidos
+   ↓
+5. Generación de reportes CSV (17 archivos)
+   ↓
+6. Compresión en ZIP
+   ↓
+7. Subida a S3 (billing.csv y recipes.csv)
+   ↓
+8. ✅ Proceso completo
+```
+
+---
+
+## 🔑 Puntos Clave
+
+1. **Mapeo de nombres:** Conecta tres convenciones diferentes (scorer name, feedback name, scorer path)
+2. **Lectura en tiempo de ejecución:** Los scorers recargan archivos `missing/` cada vez que se ejecutan
+3. **Procesamiento por etapas:** La IA puede procesar en múltiples etapas si hay configuraciones adicionales
+4. **Chunking:** Los datos se dividen en chunks para evitar límites de tokens de OpenAI
+5. **Rate limiting:** Espera 1 segundo entre chunks para evitar exceder límites de API
+6. **Subida selectiva:** Solo se suben `billing.csv` y `recipes.csv` a S3, no todos los archivos
+
+---
+
+## 📝 Notas Adicionales
+
+- Si un scorer no tiene configuración de IA, simplemente se omite del procesamiento
+- Los errores de OpenAI se capturan y registran, pero no detienen el proceso completo
+
+---
+
+## 🗂️ Gestión de Archivos: Temporales y Acumulativos
+
+### Archivos Temporales (`.temp-missing-*`)
+
+**Ubicación:** `src/reports/ososs/out/.temp-missing-20251110005613/`
+
+**¿Qué son?**
+Estos directorios se crean temporalmente para almacenar los missing antes de procesarlos con IA. Contienen los archivos CSV generados por `writeMissingReport()` que luego son leídos por `processAllStages()`.
+
+**¿Se borran automáticamente?**
+**NO.** Actualmente el código no elimina estos directorios después del procesamiento. Son "temporales" en el sentido de que:
+- Solo se usan durante el procesamiento con IA
+- No son parte del reporte final
+- Se pueden eliminar manualmente sin afectar el funcionamiento
+
+**¿Por qué no se borran automáticamente?**
+- Permiten debugging: puedes revisar qué missing se enviaron a la IA
+- Permiten re-procesamiento: si hay un error, puedes reutilizar los mismos datos
+- No ocupan mucho espacio (solo CSVs de texto)
+
+**Recomendación:**
+Si quieres limpiarlos automáticamente, podrías agregar al final de `processMissingWithAI()`:
+```typescript
+import { rmSync } from 'node:fs';
+// ... después de guardar los resultados
+rmSync(tempMissingDir, { recursive: true, force: true });
+```
+
+### Archivos en `missing/` de los Scorers
+
+**Ubicación:** `src/analyses/recipes/drug-diagnosis/missing/20251110005613.csv`
+
+**¿Qué son?**
+Estos son los archivos generados por la IA que contienen los datos enriquecidos. Se guardan en las carpetas `missing/` de cada scorer para que sean leídos en futuros análisis.
+
+**¿Se acumulan?**
+**SÍ.** Cada vez que se ejecuta el procesamiento con IA, se crea un nuevo archivo con un timestamp único:
+- `20251110005613.csv` (primera ejecución)
+- `20251110005704.csv` (segunda ejecución)
+- `20251110005815.csv` (tercera ejecución)
+- ...
+
+**¿Por qué se acumulan?**
+1. **Historial:** Permite ver qué datos se generaron en cada ejecución
+2. **No sobrescribir:** Si un archivo tiene datos buenos, no se pierden con una nueva ejecución
+3. **Lectura acumulativa:** Los scorers leen TODOS los archivos en `missing/`, así que:
+   - Datos antiguos + Datos nuevos = Base de conocimiento más completa
+   - Cada ejecución agrega conocimiento sin perder el anterior
+
+**¿Está bien este funcionamiento?**
+**SÍ, es el comportamiento deseado.** Razones:
+
+1. **Base de conocimiento creciente:**
+   ```
+   Primera ejecución: 10 combinaciones drug+icd10
+   Segunda ejecución: +5 nuevas combinaciones
+   Tercera ejecución: +3 nuevas combinaciones
+   Total disponible: 18 combinaciones
    ```
 
-2. **Escribe reportes de missing:**
-   - `missing/urls.csv`: URLs que fallaron
-   - `missing/diagnoses.csv`: Diagnósticos faltantes
-   - `missing/drugDiagnosis.csv`: Pares drug-icd10 faltantes
-   - `missing/drugSpecialty.csv`: Pares drug-specialty faltantes
-   - ... (todos los tipos de missing)
+2. **Los scorers leen todos los archivos:**
+   ```typescript
+   // En drug-diagnosis/index.ts
+   ...readFilesSorted(`${import.meta.dirname}/missing`).map(...)
+   // Lee TODOS los CSV en la carpeta missing/
+   ```
 
-3. **Escribe reportes de recetas:**
-   - `recipes.csv`: Todas las recetas con sus scores
-   - `billing.csv`: Facturación agregada
-   - `stock.csv`: Stock de medicamentos
+3. **Ventajas:**
+   - Cada ejecución mejora la base de conocimiento
+   - No se pierden datos validados anteriormente
+   - Permite revisar el historial de generaciones
 
-4. **Escribe reportes por paciente:**
-   - `patientDrugs.csv`
-   - `patientLaboratories.csv`
-   - `patientProducts.csv`
-   - `patientPharmacies.csv`
-   - `patientTotals.csv`
+**Consideraciones:**
+- Los archivos se acumulan indefinidamente
+- Si hay muchos archivos, el tiempo de lectura puede aumentar ligeramente
+- Si necesitas limpiar archivos antiguos, puedes hacerlo manualmente o agregar una lógica de rotación
 
-5. **Escribe reportes por médico:**
-   - `physicianDrugs.csv`
-   - `physicianLaboratories.csv`
-   - `physicianProducts.csv`
-   - `physicianPharmacies.csv`
-   - `physicianTotals.csv`
-
-6. **Escribe reportes por farmacia:**
-   - `pharmacyDrugs.csv`
-   - `pharmacyLaboratories.csv`
-   - `pharmacyProducts.csv`
-   - `pharmacyTotals.csv`
-
-### PASO 6: Compresión
-
-**Línea:** `await zip(reportBaseDir, ...)`
-
-**Proceso:**
-- Usa `zip-a-folder` para comprimir todo el directorio
-- Crea: `src/reports/ososs/out/ososs-20251106201612.zip`
-- Compresión: `COMPRESSION_LEVEL.high`
-
----
-
-## Resumen del Flujo Completo
-
+**Ejemplo de acumulación:**
 ```
-1. Carga módulos (define funciones, NO ejecuta)
-   ↓
-2. Primera analyzeUrls()
-   ├─ Getter: Lee URLs (cache/web)
-   ├─ Parsers: Convierte a Recipe[]
-   ├─ Scorers: Analiza recetas
-   │  └─ loadDrugToIcd10() lee 7 archivos CSV
-   └─ Retorna: analysisResult con missing
-   ↓
-3. prepareMissingData()
-   ├─ Lee carpetas en feedback/data
-   └─ Genera reportes solo para carpetas existentes
-   ↓
-4. processMissingData() (AI)
-   ├─ Parsea missing data
-   ├─ Loop de stages con OpenAI
-   │  └─ Procesa chunks, llama API, espera respuestas
-   ├─ Convierte resultados
-   └─ writeOverrides() → Escribe nuevo CSV
-   ↓
-5. Segunda analyzeUrls()
-   ├─ Getter: Lee URLs (cache)
-   ├─ Parsers: Convierte a Recipe[]
-   ├─ Scorers: Analiza recetas
-   │  └─ loadDrugToIcd10() lee 8 archivos CSV (incluye nuevo de AI)
-   └─ Retorna: analysisResult con MENOS missing
-   ↓
-6. writeReport()
-   └─ Escribe todos los CSVs finales
-   ↓
-7. zip()
-   └─ Comprime todo en .zip
+src/analyses/recipes/drug-diagnosis/missing/
+├── 20250721000000.csv  (archivo manual anterior)
+├── 20250722152600.csv  (archivo manual anterior)
+├── 20250918000000.csv  (archivo manual anterior)
+├── 20251110005613.csv  (generado por IA - ejecución 1)
+├── 20251110005704.csv  (generado por IA - ejecución 2)
+└── 20251110005815.csv  (generado por IA - ejecución 3)
 ```
 
----
-
-## Puntos Clave
-
-1. **Cache de módulos:** Node.js cachea módulos, por eso necesitas lectura dinámica
-2. **Dos ejecuciones:** `analyzeUrls()` se ejecuta dos veces (antes y después de AI)
-3. **Lectura dinámica:** `loadDrugToIcd10()` se llama en cada ejecución del scorer
-4. **Overrides:** Se escriben entre la primera y segunda ejecución
-5. **Resultado mejorado:** La segunda ejecución usa los datos de AI y tiene menos missing
+Todos estos archivos se leen y se combinan cuando el scorer se ejecuta.
 
