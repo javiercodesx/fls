@@ -608,3 +608,319 @@ src/analyses/recipes/drug-diagnosis/missing/
 
 Todos estos archivos se leen y se combinan cuando el scorer se ejecuta.
 
+---
+
+## 🔄 Cambio Crítico: Lectura de Archivos en Tiempo de Ejecución vs Tiempo de Importación
+
+### El Problema Original
+
+**¿Cómo estaba antes?**
+
+Antes del cambio, el código leía los archivos `missing/` **al importar el módulo**:
+
+```typescript
+// ❌ CÓDIGO ANTERIOR (no funciona con IA)
+const drugToIcd10: Map<string, Map<string, Category>> = new Map(
+  Array.from(
+    array_categorize([
+      // ... datos del dataset base ...
+      ...readFilesSorted(`${import.meta.dirname}/missing`).map(...)
+    ])
+  )
+);
+
+const scorer = (recipes) => {
+  // Usa drugToIcd10 que ya fue inicializado al importar
+  const icd10s = drugToIcd10.get(drug);
+  // ...
+}
+```
+
+**¿Qué es un "módulo" en JavaScript/TypeScript?**
+
+Un módulo es un archivo `.ts` o `.js` que se importa usando `import`. Cuando Node.js/TypeScript ejecuta tu código:
+
+1. **Primera vez que se importa un módulo:**
+   - Lee el archivo
+   - Ejecuta TODO el código de nivel superior (fuera de funciones)
+   - Guarda el resultado en un caché
+   - Retorna las exportaciones
+
+2. **Siguientes veces que se importa:**
+   - **NO vuelve a ejecutar el código**
+   - Retorna directamente desde el caché
+
+**Ejemplo del problema:**
+
+```typescript
+// archivo: scorer.ts
+console.log('Módulo cargado'); // ← Solo se ejecuta UNA VEZ
+
+const datos = readFileSync('datos.json'); // ← Solo se lee UNA VEZ
+
+export const scorer = () => {
+  return datos; // ← Siempre retorna los mismos datos
+};
+```
+
+Si ejecutas:
+```typescript
+import { scorer } from './scorer.ts'; // ← Lee datos.json
+// ... tiempo después ...
+// Modificas datos.json
+scorer(); // ← AÚN retorna los datos ANTIGUOS (del caché)
+```
+
+### El Problema en Nuestro Caso
+
+**Flujo con el código anterior:**
+
+```
+1. Se ejecuta: pnpx tsx src/reports/ososs/index.ts ai
+   ↓
+2. Node.js importa src/reports/ososs/index.ts
+   ↓
+3. index.ts importa src/analyses/index.ts
+   ↓
+4. analyses/index.ts importa src/analyses/recipes/index.ts
+   ↓
+5. recipes/index.ts importa src/analyses/recipes/drug-diagnosis/index.ts
+   ↓
+6. ⚠️ AQUÍ SE EJECUTA EL CÓDIGO DE NIVEL SUPERIOR:
+   const drugToIcd10 = new Map(...readFilesSorted('missing')...);
+   // Lee: missing/20250721000000.csv
+   // Lee: missing/20250918000000.csv
+   // NO hay archivos nuevos aún
+   // drugToIcd10 se inicializa con solo estos 2 archivos
+   ↓
+7. Se ejecuta analyzeUrls() → identifica missing
+   ↓
+8. Se procesa con IA → genera missing/20251110005613.csv
+   ↓
+9. Se ejecuta analyzeUrls() NUEVAMENTE
+   ↓
+10. ⚠️ PROBLEMA: El módulo YA ESTÁ CARGADO
+    // Node.js NO vuelve a ejecutar el código de nivel superior
+    // drugToIcd10 sigue teniendo solo los 2 archivos antiguos
+    // El nuevo archivo 20251110005613.csv NO se lee
+    ↓
+11. Resultado: Los missing NO se reducen
+```
+
+**Visualización del problema:**
+
+```
+Tiempo de importación (una sola vez):
+┌─────────────────────────────────────┐
+│ import drug-diagnosis/index.ts      │
+│   ↓                                  │
+│ Ejecuta:                             │
+│   readFilesSorted('missing')        │
+│   → [20250721000000.csv,            │
+│      20250918000000.csv]            │
+│   ↓                                  │
+│ Inicializa: drugToIcd10             │
+│   (con solo 2 archivos)             │
+│   ↓                                  │
+│ Guarda en caché del módulo          │
+└─────────────────────────────────────┘
+
+Tiempo de ejecución (múltiples veces):
+┌─────────────────────────────────────┐
+│ analyzeUrls() → scorer()             │
+│   ↓                                  │
+│ Usa: drugToIcd10 (del caché)        │
+│   (sigue teniendo solo 2 archivos)  │
+│   ↓                                  │
+│ ❌ NO lee el nuevo archivo          │
+│   20251110005613.csv                 │
+└─────────────────────────────────────┘
+```
+
+### La Solución: Lectura en Tiempo de Ejecución
+
+**¿Cómo está ahora?**
+
+El código ahora lee los archivos **cada vez que se ejecuta el scorer**:
+
+```typescript
+// ✅ CÓDIGO ACTUAL (funciona con IA)
+const loadDrugToIcd10 = () => {
+  // Esta función se puede llamar múltiples veces
+  return new Map(
+    Array.from(
+      array_categorize([
+        // ... datos del dataset base ...
+        ...readFilesSorted(`${import.meta.dirname}/missing`).map(...)
+        // ↑ Se ejecuta CADA VEZ que se llama la función
+      ])
+    )
+  );
+};
+
+const scorer = (recipes) => {
+  // ⚠️ IMPORTANTE: Se recarga cada vez que se ejecuta el scorer
+  const drugToIcd10 = loadDrugToIcd10(); // ← Lee archivos AHORA
+  // Usa drugToIcd10 que tiene TODOS los archivos (incluyendo nuevos)
+}
+```
+
+**Flujo con el código actual:**
+
+```
+1. Se ejecuta: pnpx tsx src/reports/ososs/index.ts ai
+   ↓
+2. Node.js importa todos los módulos
+   ↓
+3. ⚠️ loadDrugToIcd10() NO se ejecuta aún
+   (solo se define la función)
+   ↓
+4. Se ejecuta analyzeUrls() → identifica missing
+   ↓
+5. Se procesa con IA → genera missing/20251110005613.csv
+   ↓
+6. Se ejecuta analyzeUrls() NUEVAMENTE
+   ↓
+7. ✅ scorer() se ejecuta
+   ↓
+8. ✅ loadDrugToIcd10() se LLAMA (no estaba en caché)
+   ↓
+9. ✅ readFilesSorted('missing') se ejecuta AHORA
+   // Lee: missing/20250721000000.csv
+   // Lee: missing/20250918000000.csv
+   // Lee: missing/20251110005613.csv ← NUEVO ARCHIVO
+   ↓
+10. ✅ drugToIcd10 se inicializa con TODOS los archivos
+    ↓
+11. ✅ Resultado: Los missing SÍ se reducen
+```
+
+**Visualización de la solución:**
+
+```
+Tiempo de importación (una sola vez):
+┌─────────────────────────────────────┐
+│ import drug-diagnosis/index.ts      │
+│   ↓                                  │
+│ Define: loadDrugToIcd10()           │
+│   (NO ejecuta, solo define)        │
+│   ↓                                  │
+│ Guarda función en caché             │
+└─────────────────────────────────────┘
+
+Tiempo de ejecución (múltiples veces):
+┌─────────────────────────────────────┐
+│ analyzeUrls() → scorer()             │
+│   ↓                                  │
+│ Ejecuta: loadDrugToIcd10()          │
+│   ↓                                  │
+│ Ejecuta: readFilesSorted('missing') │
+│   → [20250721000000.csv,            │
+│      20250918000000.csv,            │
+│      20251110005613.csv] ← NUEVO   │
+│   ↓                                  │
+│ Inicializa: drugToIcd10           │
+│   (con TODOS los archivos)          │
+│   ↓                                  │
+│ ✅ Usa datos actualizados           │
+└─────────────────────────────────────┘
+```
+
+### Comparación Detallada
+
+| Aspecto | Código Anterior ❌ | Código Actual ✅ |
+|---------|-------------------|------------------|
+| **Cuándo se lee** | Al importar el módulo (una vez) | Cada vez que se ejecuta el scorer |
+| **Caché de módulo** | Los datos quedan en caché | La función queda en caché, pero se ejecuta cada vez |
+| **Nuevos archivos** | ❌ No se leen | ✅ Se leen |
+| **Re-análisis** | ❌ Usa datos antiguos | ✅ Usa datos actualizados |
+| **Performance** | ⚡ Más rápido (lee una vez) | 🐌 Más lento (lee cada vez) |
+| **Funcionalidad con IA** | ❌ No funciona | ✅ Funciona correctamente |
+
+### ¿Por Qué Este Cambio es Necesario?
+
+**Razón 1: El Sistema de Módulos de Node.js**
+
+Node.js (y TypeScript compilado) usa un sistema de caché de módulos:
+- Cada módulo se ejecuta **una sola vez** cuando se importa por primera vez
+- El código de nivel superior (fuera de funciones) se ejecuta **solo una vez**
+- Las constantes y variables se inicializan **solo una vez**
+
+**Razón 2: El Flujo con IA Requiere Re-lectura**
+
+Nuestro flujo es:
+1. Análisis inicial → identifica missing
+2. IA genera nuevos archivos `missing/`
+3. Re-análisis → debe leer los nuevos archivos
+
+Si los archivos se leen solo al importar, el paso 3 no puede ver los nuevos archivos.
+
+**Razón 3: La Solución Mantiene Compatibilidad**
+
+La solución actual:
+- Mantiene la función `loadDrugToIcd10()` disponible
+- Se puede llamar múltiples veces
+- Cada llamada lee los archivos frescos del disco
+- No rompe código existente
+
+### Ejemplo Concreto del Problema
+
+**Con código anterior (no funciona):**
+
+```typescript
+// T=0: Se importa el módulo
+const drugToIcd10 = new Map(...readFilesSorted('missing')...);
+// Lee: [archivo1.csv, archivo2.csv]
+// drugToIcd10 tiene 100 combinaciones
+
+// T=1: Se ejecuta analyzeUrls() primera vez
+scorer(recipes);
+// Usa drugToIcd10 con 100 combinaciones
+// Identifica 50 missing
+
+// T=2: IA genera archivo3.csv con 30 nuevas combinaciones
+// Guarda: missing/20251110005613.csv
+
+// T=3: Se ejecuta analyzeUrls() segunda vez
+scorer(recipes);
+// ⚠️ PROBLEMA: drugToIcd10 sigue teniendo solo 100 combinaciones
+// (no lee archivo3.csv porque el módulo ya está en caché)
+// Identifica 50 missing (igual que antes) ❌
+```
+
+**Con código actual (funciona):**
+
+```typescript
+// T=0: Se importa el módulo
+const loadDrugToIcd10 = () => { ... };
+// Solo se define la función, NO se ejecuta
+
+// T=1: Se ejecuta analyzeUrls() primera vez
+scorer(recipes);
+  → loadDrugToIcd10(); // Se ejecuta AHORA
+  → Lee: [archivo1.csv, archivo2.csv]
+  → drugToIcd10 tiene 100 combinaciones
+// Identifica 50 missing
+
+// T=2: IA genera archivo3.csv con 30 nuevas combinaciones
+// Guarda: missing/20251110005613.csv
+
+// T=3: Se ejecuta analyzeUrls() segunda vez
+scorer(recipes);
+  → loadDrugToIcd10(); // Se ejecuta AHORA (nuevamente)
+  → Lee: [archivo1.csv, archivo2.csv, archivo3.csv] ← NUEVO
+  → drugToIcd10 tiene 130 combinaciones ✅
+// Identifica 20 missing (reducción de 30) ✅
+```
+
+### Conclusión
+
+El cambio de leer archivos **al importar** a leer archivos **en tiempo de ejecución** es necesario porque:
+
+1. **El sistema de módulos de Node.js cachea el código** ejecutado al importar
+2. **Los nuevos archivos generados por la IA** aparecen después de que el módulo ya fue importado
+3. **El re-análisis necesita leer los nuevos archivos** para reducir los missing
+4. **La solución permite re-lectura** cada vez que se ejecuta el scorer
+
+Sin este cambio, el sistema de IA no funcionaría porque los datos enriquecidos nunca se usarían en el segundo análisis.
+
