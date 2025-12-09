@@ -1,962 +1,384 @@
-# Análisis del Sistema de Detección de Fraude Farmacéutico
+# Explicación del Código: `componentToAtc`
 
-## Tabla de Contenidos
+Este documento explica en detalle cómo funciona la función `componentToAtc` y cómo se transforman los datos paso a paso.
 
-1. [Introducción](#introducción)
-2. [Lógica General del Sistema](#lógica-general-del-sistema)
-3. [Conceptos Clave](#conceptos-clave)
-4. [Por Qué Matchear Drogas con Códigos ICD, Componentes, etc.](#por-qué-matchear-drogas-con-códigos-icd-componentes-etc)
-5. [Análisis Detallado: `rcta-to-specialty/index.ts`](#análisis-detallado-rcta-to-specialtyindexts)
-6. [Flujo Completo del Sistema](#flujo-completo-del-sistema)
-7. [Ejemplos Prácticos](#ejemplos-prácticos)
+## Objetivo
 
----
+La función `componentToAtc` crea un mapa que relaciona cada componente (droga/fármaco) con sus códigos ATC (Anatomical Therapeutic Chemical) correspondientes. El resultado es un `Map<string, Set<string>>` donde:
+- **Clave**: Nombre del componente (droga)
+- **Valor**: Set de códigos ATC asociados a ese componente
 
-## Introducción
+## Estructura de Datos Inicial
 
-Este documento explica la lógica y funcionamiento del sistema de detección de fraude farmacéutico, enfocándose en:
+### `AlfaBetaRegistry`
 
-1. **Por qué** se realizan matcheos entre drogas, códigos ICD-10, especialidades médicas, componentes, etc.
-2. **Cómo** funciona específicamente el archivo `rcta-to-specialty/index.ts`
-3. **Qué** problemas de fraude se detectan con estos matcheos
+El `AlfaBetaRegistry` es un registro que contiene información temporal de productos farmacéuticos. Cada producto tiene:
 
----
+- **`key`**: Un número identificador único del producto
+- **`atcCodes`**: Una serie temporal (`TimeSeries`) que contiene los códigos ATC del producto en diferentes momentos
+- **`components`**: Una serie temporal que contiene los componentes (drogas) del producto en diferentes momentos
 
-## Lógica General del Sistema
+### `AlfaBetaTimeSeries`
 
-### El Problema de Fraude Farmacéutico
+Cada entrada del registro es un `AlfaBetaTimeSeries` que contiene:
+- `atcCodes.allMoments`: Array de fechas donde hay códigos ATC definidos
+- `atcCodes.lookup(moment)`: Función que devuelve un `Set<string>` con los códigos ATC para una fecha específica
+- `components.allMoments`: Array de fechas donde hay componentes definidos
+- `components.lookup(moment)`: Función que devuelve un array de `AlfaBetaComponent` para una fecha específica
 
-En el sistema de salud, especialmente en obras sociales y prepagas, existen múltiples formas de fraude relacionadas con recetas médicas:
+## Transformación Paso a Paso
 
-#### Tipos de Fraude Detectados
-
-1. **Medicamentos prescritos sin diagnóstico válido**
-   - Un médico prescribe un medicamento sin un diagnóstico que lo justifique
-   - Ejemplo: Prescribir insulina sin diagnóstico de diabetes
-
-2. **Medicamentos prescritos por especialistas incorrectos**
-   - Un médico de una especialidad prescribe medicamentos que típicamente maneja otra especialidad
-   - Ejemplo: Un pediatra prescribiendo medicamentos de cardiología para adultos
-
-3. **Interacciones peligrosas entre medicamentos**
-   - Combinaciones de medicamentos que pueden causar efectos adversos graves
-   - Ejemplo: Anticoagulantes con antiinflamatorios no esteroideos
-
-4. **Dosificaciones incorrectas**
-   - Medicamentos prescritos con dosis que no corresponden a la presentación disponible
-   - Ejemplo: Prescribir 500mg cuando solo existe presentación de 250mg
-
-5. **Precios incorrectos o inflados**
-   - Medicamentos dispensados a precios que no corresponden
-   - Ejemplo: Cobrar precio de marca cuando se dispensó genérico
-
-6. **Medicamentos sin diagnóstico respaldatorio**
-   - Medicamentos prescritos sin ningún diagnóstico asociado en la receta
-
-### Objetivo del Sistema
-
-El sistema analiza recetas médicas y asigna un **score de sospecha** basado en múltiples validaciones. Cuanto mayor el score, más probable es que haya fraude o error.
-
----
-
-## Conceptos Clave
-
-Para entender el sistema, es fundamental conocer estos conceptos:
-
-### 1. RCTA (Registro de Códigos Terapéuticos Argentinos)
-
-**¿Qué es?**
-- Código único que identifica un medicamento o combinación de medicamentos en Argentina
-- Es el identificador estándar usado en el sistema de salud argentino
-
-**Ejemplos:**
-- `PARACETAMOL` - Medicamento simple
-- `PARACETAMOL+CODEINA` - Medicamento compuesto (combinación)
-- `METFORMINA` - Otro medicamento simple
-
-**Características:**
-- Puede ser **simple** (un solo medicamento) o **compuesto** (varios medicamentos separados por `+`)
-- Se normaliza y limpia para evitar variaciones (mayúsculas/minúsculas, acentos, espacios, etc.)
-
-**Uso en el sistema:**
-- Se usa como clave para buscar información sobre el medicamento
-- Permite matchear medicamentos con diagnósticos, especialidades, precios, etc.
-
-### 2. ICD-10 (Clasificación Internacional de Enfermedades, 10ª Revisión)
-
-**¿Qué es?**
-- Sistema de codificación estándar internacional para diagnósticos médicos
-- Cada código representa una enfermedad, condición o síntoma específico
-
-**Ejemplos:**
-- `E11` - Diabetes mellitus tipo 2
-- `I10` - Hipertensión esencial (primaria)
-- `J44` - Otra enfermedad pulmonar obstructiva crónica
-- `K59.0` - Estreñimiento
-
-**Estructura:**
-- Código alfanumérico (letra + números)
-- Puede tener subcategorías (ej: `K59.0`)
-- Los primeros 3 caracteres suelen ser suficientes para la mayoría de validaciones
-
-**Uso en el sistema:**
-- Permite validar si un medicamento es apropiado para un diagnóstico
-- Ejemplo: Si hay diagnóstico `E11` (diabetes), se espera que los medicamentos sean para diabetes (insulina, metformina, etc.)
-
-### 3. Especialidad Médica
-
-**¿Qué es?**
-- Área de especialización de un médico
-- Indica en qué campo de la medicina se especializa el profesional
-
-**Ejemplos:**
-- `CARDIOLOGIA` - Especialista en corazón y sistema circulatorio
-- `ENDOCRINOLOGIA` - Especialista en hormonas y metabolismo
-- `PEDIATRIA` - Especialista en niños
-- `CLINICA_MEDICA` - Médico clínico general
-- `TRAUMATOLOGIA` - Especialista en huesos y articulaciones
-
-**Uso en el sistema:**
-- Permite validar si un médico de cierta especialidad suele prescribir ciertos medicamentos
-- Ejemplo: Un cardiólogo prescribiendo insulina (medicamento de endocrinología) es sospechoso
-
-### 4. ATC (Anatomical Therapeutic Chemical Classification System)
-
-**¿Qué es?**
-- Sistema de clasificación de medicamentos desarrollado por la OMS
-- Clasifica medicamentos por:
-  - **A**nátomo (sistema del cuerpo)
-  - **T**erapéutico (uso terapéutico)
-  - **C**hemical (grupo químico)
-
-**Ejemplos:**
-- `A10BA02` - Metformina (para diabetes)
-  - `A10` = Medicamentos para diabetes
-  - `A10B` = Medicamentos hipoglucemiantes
-  - `A10BA` = Biguanidas
-  - `A10BA02` = Metformina específicamente
-
-**Uso en el sistema:**
-- Facilita el mapeo entre medicamentos y diagnósticos
-- Permite encontrar relaciones indirectas: Medicamento → ATC → ICD-10
-
-### 5. Componentes / Principios Activos
-
-**¿Qué es?**
-- El ingrediente activo real de un medicamento
-- Los nombres comerciales pueden variar, pero el principio activo es el mismo
-
-**Ejemplos:**
-- Nombre comercial: `DOLAC`, `TYLENOL`, `PANADOL`
-- Principio activo: `PARACETAMOL`
-
-**Uso en el sistema:**
-- Normaliza diferentes nombres comerciales al mismo principio activo
-- Permite comparar medicamentos que son equivalentes pero tienen nombres diferentes
-
----
-
-## Por Qué Matchear Drogas con Códigos ICD, Componentes, etc.
-
-### Matcheo: Droga ↔ ICD-10 (Diagnóstico)
-
-#### Objetivo
-Detectar si un medicamento prescrito es apropiado para el diagnóstico del paciente.
-
-#### ¿Por qué es importante?
-Un medicamento debe estar relacionado con el diagnóstico del paciente. Si no hay relación, puede ser:
-- **Error médico**: El médico se equivocó
-- **Fraude**: Se está prescribiendo un medicamento innecesario para generar facturación
-
-#### Cómo funciona
-1. Se tiene un mapeo: `Droga → [ICD-10 válidos]`
-2. Cuando se analiza una receta:
-   - Se extrae el medicamento prescrito
-   - Se extraen los diagnósticos (ICD-10) del paciente
-   - Se verifica si el medicamento está en la lista de medicamentos válidos para esos diagnósticos
-
-#### Categorías de Resultado
-- **Categoría 0**: Combinación medicamento/diagnóstico no requiere revisión (válida)
-- **Categoría 1**: Combinación medicamento/diagnóstico requiere revisión (sospechosa)
-- **Categoría 2**: Medicación sin diagnóstico respaldatorio (muy sospechosa)
-
-#### Ejemplo Práctico
-```
-Receta:
-- Medicamento: INSULINA
-- Diagnóstico: E11 (Diabetes tipo 2)
-
-Análisis:
-- INSULINA está en la lista de medicamentos válidos para E11
-- Resultado: Categoría 0 (válido)
-```
-
-```
-Receta:
-- Medicamento: INSULINA
-- Diagnóstico: I10 (Hipertensión)
-
-Análisis:
-- INSULINA NO está en la lista de medicamentos válidos para I10
-- Resultado: Categoría 2 (muy sospechoso - requiere revisión)
-```
-
-### Matcheo: Droga ↔ Especialidad
-
-#### Objetivo
-Detectar si un médico de cierta especialidad suele prescribir ciertos medicamentos.
-
-#### ¿Por qué es importante?
-Cada especialidad médica tiene medicamentos que maneja frecuentemente. Si un médico de una especialidad prescribe medicamentos de otra, puede ser:
-- **Legítimo**: Casos especiales o interconsultas
-- **Sospechoso**: El médico no tiene la especialización adecuada o hay fraude
-
-#### Cómo funciona
-1. Se tiene un mapeo: `Droga → Especialidad → Score (1-5)`
-2. Cuando se analiza una receta:
-   - Se extrae la especialidad del médico
-   - Se extrae el medicamento prescrito
-   - Se consulta el score en el mapeo
-   - Score alto (4-5) = sospechoso
-
-#### Sistema de Scoring
-- **Score 1**: Combinación irrelevante (no hay relación clara)
-- **Score 2**: Combinación frecuente (especialidad suele prescribir este medicamento)
-- **Score 3**: Combinación poco frecuente (puede ser legítimo pero poco común)
-- **Score 4**: Combinación especialidad/medicamento - revisión recomendada
-- **Score 5**: Combinación especialidad/medicamento - requiere revisión (muy sospechoso)
-
-#### Ejemplo Práctico
-```
-Receta:
-- Médico: Especialista en CARDIOLOGIA
-- Medicamento: ATENOLOL (medicamento para hipertensión/cardíaco)
-
-Análisis:
-- ATENOLOL + CARDIOLOGIA tiene score 2 (frecuente)
-- Resultado: Válido
-```
-
-```
-Receta:
-- Médico: Especialista en PEDIATRIA
-- Medicamento: WARFARINA (anticoagulante, típico de cardiología/hepatología)
-
-Análisis:
-- WARFARINA + PEDIATRIA tiene score 5 (muy sospechoso)
-- Resultado: Requiere revisión urgente
-```
-
-### Matcheo: Droga ↔ Droga (Interacciones)
-
-#### Objetivo
-Detectar interacciones peligrosas entre medicamentos prescritos en la misma receta.
-
-#### ¿Por qué es importante?
-Algunas combinaciones de medicamentos pueden ser peligrosas o incluso mortales. Ejemplos:
-- Anticoagulantes + antiinflamatorios = riesgo de sangrado
-- Ciertos antibióticos + alcohol = efectos tóxicos
-
-#### Cómo funciona
-1. Se tiene un mapeo: `Droga A → Droga B → Tipo de interacción`
-2. Cuando se analiza una receta:
-   - Se extraen todos los medicamentos
-   - Se verifica si hay interacciones conocidas entre ellos
-   - Se marca como sospechoso si hay interacciones peligrosas
-
-#### Ejemplo Práctico
-```
-Receta:
-- Medicamento 1: WARFARINA (anticoagulante)
-- Medicamento 2: IBUPROFENO (antiinflamatorio)
-
-Análisis:
-- WARFARINA + IBUPROFENO tiene interacción peligrosa (riesgo de sangrado)
-- Resultado: Muy sospechoso - requiere revisión médica
-```
-
-### Matcheo: Componentes / Normalización de Nombres
-
-#### Objetivo
-Normalizar diferentes nombres comerciales al mismo principio activo.
-
-#### ¿Por qué es importante?
-Un mismo medicamento puede tener múltiples nombres comerciales:
-- `DOLAC` = `PARACETAMOL`
-- `TYLENOL` = `PARACETAMOL`
-- `PANADOL` = `PARACETAMOL`
-
-Sin normalización, el sistema no podría reconocer que son el mismo medicamento.
-
-#### Cómo funciona
-1. Se tiene un mapeo: `Nombre Comercial → Principio Activo (RCTA)`
-2. Cuando se analiza una receta:
-   - Se normaliza el nombre comercial al RCTA
-   - Se usa el RCTA para todas las validaciones
-
-#### Ejemplo Práctico
-```
-Receta:
-- Medicamento prescrito: "DOLAC 500mg"
-- Diagnóstico: E11 (Diabetes)
-
-Análisis:
-1. "DOLAC" se normaliza a "PARACETAMOL"
-2. Se verifica si PARACETAMOL es válido para E11
-3. PARACETAMOL no es típico para diabetes
-4. Resultado: Sospechoso
-```
-
-### Matcheo: Droga ↔ Precio
-
-#### Objetivo
-Detectar si el precio de un medicamento es razonable.
-
-#### ¿Por qué es importante?
-Puede haber fraude por:
-- Precios inflados
-- Cobrar precio de marca cuando se dispensó genérico
-- Precios que no corresponden a la presentación
-
-#### Cómo funciona
-1. Se tiene un mapeo: `Droga + Presentación → Precio esperado`
-2. Cuando se analiza una receta:
-   - Se compara el precio dispensado con el precio esperado
-   - Si hay gran diferencia, se marca como sospechoso
-
-### Matcheo: Droga ↔ Dosificación / Unidades
-
-#### Objetivo
-Detectar si la dosificación prescrita corresponde a las presentaciones disponibles.
-
-#### ¿Por qué es importante?
-Puede haber errores o fraudes por:
-- Prescribir dosis que no existen en el mercado
-- Prescribir más unidades de las necesarias
-- Inconsistencias entre lo prescrito y lo dispensado
-
----
-
-## Análisis Detallado: `rcta-to-specialty/index.ts`
-
-### Propósito del Archivo
-
-Este archivo genera un **mapeo de códigos RCTA a especialidades médicas** con un sistema de scoring (1-5) que indica qué tan común es que una especialidad prescriba cierto medicamento.
-
-**Input:**
-- Lista de códigos RCTA limpios/normalizados
-- Datos de especialidades y medicamentos de OSOSS (obra social)
-
-**Output:**
-- Archivo JSON: `rcta-to-specialty.json`
-- Estructura: `{ "RCTA": { "ESPECIALIDAD": score } }`
-
-**Uso posterior:**
-- Este JSON es consumido por el analizador `drug-specialty` para validar recetas
-
-### Código Paso a Paso
-
-#### Paso 1: Función de Conversión de Score
+### Paso 1: Cargar el Registro
 
 ```typescript
-const scoreToInt: (score: string) => number = (score: string): number => {
-  return (
-    {
-      A: 1,
-      B: 2,
-      C: 3,
-      D: 4,
-      E: 5,
-    }[score] ?? 0
-  );
-};
+const registry: AlfaBetaRegistry = AlfaBetaRegistry.load();
 ```
 
-**¿Qué hace?**
-- Convierte un score en letra (A, B, C, D, E) a número (1, 2, 3, 4, 5)
-- A = 1 (más común/irrelevante)
-- E = 5 (muy sospechoso/requiere revisión)
-- Si no encuentra la letra, retorna 0
+**¿Qué contiene `registry`?**
+- Un mapa interno de productos farmacéuticos
+- Cada producto tiene información temporal (cambios a lo largo del tiempo)
+- Puede contener miles de productos
 
-**Ejemplo:**
-- Input: `"B"` → Output: `2`
-- Input: `"E"` → Output: `5`
-
-#### Paso 2: Cargar Datos de Especialidades y Medicamentos
-
-```typescript
-const drugNameToSpecialtyToScore: Map<string, Map<string, number>> = new Map();
-for (const [specialty, drugName, , score] of readRaw(
-  `${import.meta.dirname}/../../datasources/specialty-medications-ososs/out/specialty-medications-ososs.csv`,
-) as [string, string, string, string, string, string, string, string, string][]) {
-  drugNameToSpecialtyToScore.set(
-    drugName,
-    (drugNameToSpecialtyToScore.get(drugName) ?? new Map<string, number>()).set(specialty, scoreToInt(score)),
-  );
-}
+**Estructura conceptual:**
 ```
-
-**¿Qué hace?**
-1. Lee un archivo CSV con datos de especialidades y medicamentos
-2. Estructura del CSV: `[especialidad, nombreDroga, ..., score]`
-3. Construye un mapa anidado: `droga → especialidad → score`
-
-**Estructura resultante:**
-```typescript
-Map {
-  "PARACETAMOL" => Map {
-    "PEDIATRIA" => 2,
-    "CLINICA_MEDICA" => 1,
-    "TRAUMATOLOGIA" => 2
+registry = {
+  key1: AlfaBetaTimeSeries {
+    atcCodes: TimeSeries<Set<string>>,
+    components: TimeSeries<AlfaBetaComponent[]>
   },
-  "INSULINA" => Map {
-    "ENDOCRINOLOGIA" => 1,
-    "CLINICA_MEDICA" => 2
-  }
-}
-```
-
-**Ejemplo de datos del CSV:**
-```
-PEDIATRIA,PARACETAMOL,...,B
-CLINICA_MEDICA,PARACETAMOL,...,A
-ENDOCRINOLOGIA,INSULINA,...,A
-```
-
-#### Paso 3: Extraer Lista de Especialidades
-
-```typescript
-const specialties: Set<string> = new Set<string>(
-  Array.from(drugNameToSpecialtyToScore.values()).flatMap((specialtyToScore: Map<string, number>): string[] =>
-    Array.from(specialtyToScore.keys()),
-  ),
-);
-```
-
-**¿Qué hace?**
-- Extrae todas las especialidades únicas del mapa anterior
-- Crea un Set para evitar duplicados
-
-**Resultado:**
-```typescript
-Set {
-  "PEDIATRIA",
-  "CLINICA_MEDICA",
-  "ENDOCRINOLOGIA",
-  "CARDIOLOGIA",
+  key2: AlfaBetaTimeSeries { ... },
   ...
 }
 ```
 
-#### Paso 4: Cargar Códigos RCTA Limpios
+### Paso 2: Obtener Todas las Claves
 
 ```typescript
-const cleanRcta: Set<string> = new Set<string>(
-  readStringPairsAsMap(`${import.meta.dirname}/../rcta/out/rcta-composed-to-rcta-composed-clean.csv`).values(),
-).difference(new Set<string>(['']));
+registry.getAllKeys()
 ```
 
-**¿Qué hace?**
-1. Lee un archivo CSV que mapea RCTA compuestos a RCTA compuestos limpios
-2. Extrae todos los valores (los RCTA limpios)
-3. Filtra valores vacíos
+**¿Qué devuelve?**
+- Un array de números: `number[]`
+- Ejemplo: `[1, 2, 3, 4, 5, ...]`
+- Cada número es un identificador único de un producto farmacéutico
 
-**Ejemplo del CSV:**
-```
-RCTA_ORIGINAL,RCTA_LIMPIO
-paracetamol+codeina,PARACETAMOL+CODEINA
-ibuprofeno 600,IBUPROFENO
-```
+**Tipo de retorno:** `number[]`
 
-**Resultado:**
-```typescript
-Set {
-  "PARACETAMOL+CODEINA",
-  "IBUPROFENO",
-  "METFORMINA",
-  ...
-}
-```
-
-#### Paso 5: Mapear Cada RCTA a Especialidades
+### Paso 3: `flatMap` sobre las Claves
 
 ```typescript
-const rctaToSpecialty: Map<string, Map<string, number>> = new Map<string, Map<string, number>>();
-
-for (const rcta of cleanRcta) {
-  for (const specialty of specialties) {
-    let score: number | undefined = drugNameToSpecialtyToScore.get(rcta)?.get(specialty);
-    // ... lógica de cálculo de score ...
-  }
-}
-```
-
-**¿Qué hace?**
-- Para cada RCTA y cada especialidad, busca un score
-- Si no encuentra score directo, intenta otras estrategias (ver siguiente paso)
-
-#### Paso 6: Manejo de RCTA Compuestos (con `+`)
-
-```typescript
-if (!defined(score)) {
-  score = Math.min(
-    ...rcta
-      .split('+')
-      .map((rctaPart: string): number | undefined => drugNameToSpecialtyToScore.get(rctaPart)?.get(specialty))
-      .filter(defined),
-  );
-  if (Infinity === score) {
-    score = undefined;
-  }
-}
-```
-
-**¿Qué hace?**
-1. Si no encuentra score directo para el RCTA completo
-2. Y el RCTA es compuesto (contiene `+`), lo separa en partes
-3. Busca score para cada parte individual
-4. Toma el **mínimo** (más restrictivo/conservador)
-5. Si no encuentra ningún score (resultado es `Infinity`), deja `undefined`
-
-**Ejemplo:**
-```
-RCTA: "PARACETAMOL+CODEINA"
-Especialidad: "PEDIATRIA"
-
-1. Busca score para "PARACETAMOL+CODEINA" completo → No existe
-2. Separa: ["PARACETAMOL", "CODEINA"]
-3. Busca:
-   - "PARACETAMOL" + "PEDIATRIA" → score 2
-   - "CODEINA" + "PEDIATRIA" → score 3
-4. Toma mínimo: min(2, 3) = 2
-5. Resultado: score = 2
-```
-
-**¿Por qué el mínimo?**
-- Si una parte del medicamento compuesto es muy sospechosa (score alto), toda la combinación debe ser sospechosa
-- Es más conservador y seguro para detectar fraudes
-
-#### Paso 7: Guardar Resultado Final
-
-```typescript
-rctaToSpecialty.set(rcta, (rctaToSpecialty.get(rcta) ?? new Map<string, number>()).set(specialty, score ?? 0));
-```
-
-**¿Qué hace?**
-- Guarda el score calculado en el mapa final
-- Si no hay score, usa 0 (desconocido)
-
-#### Paso 8: Escribir Archivo JSON
-
-```typescript
-writeFileSync(
-  `${import.meta.dirname}/out/rcta-to-specialty.json`,
-  StrictJSON.stringify(
-    normalizeJSONLike(
-      Object.fromEntries(
-        Array.from(
-          rctaToSpecialty.entries(),
-          ([rcta, specialtyToScore]: [string, Map<string, number>]): [string, { [_: string]: number }] => [
-            rcta,
-            Object.fromEntries(specialtyToScore.entries()),
-          ],
-        ),
-      ),
-    ),
-    undefined,
-    2,
-  ),
-  { encoding: 'utf-8', flush: true },
-);
-```
-
-**¿Qué hace?**
-1. Convierte el Map anidado a un objeto JSON
-2. Normaliza el JSON (formato consistente)
-3. Escribe el archivo con indentación de 2 espacios
-
-**Estructura del JSON resultante:**
-```json
-{
-  "PARACETAMOL": {
-    "PEDIATRIA": 2,
-    "CLINICA_MEDICA": 1,
-    "TRAUMATOLOGIA": 2
-  },
-  "PARACETAMOL+CODEINA": {
-    "PEDIATRIA": 2,
-    "CLINICA_MEDICA": 1,
-    "TRAUMATOLOGIA": 2
-  },
-  "INSULINA": {
-    "ENDOCRINOLOGIA": 1,
-    "CLINICA_MEDICA": 2
-  }
-}
-```
-
-### Ejemplo Completo de Ejecución
-
-#### Input
-
-**Archivo `specialty-medications-ososs.csv`:**
-```csv
-PEDIATRIA,PARACETAMOL,col3,col4,B
-CLINICA_MEDICA,PARACETAMOL,col3,col4,A
-PEDIATRIA,CODEINA,col3,col4,C
-CLINICA_MEDICA,CODEINA,col3,col4,B
-ENDOCRINOLOGIA,INSULINA,col3,col4,A
-```
-
-**Archivo `rcta-composed-to-rcta-composed-clean.csv`:**
-```csv
-original,clean
-paracetamol,PARACETAMOL
-codeina,CODEINA
-paracetamol+codeina,PARACETAMOL+CODEINA
-insulina,INSULINA
-```
-
-#### Procesamiento
-
-1. **Carga de datos de especialidades:**
-   ```typescript
-   drugNameToSpecialtyToScore = Map {
-    "PARACETAMOL" => Map {
-      "PEDIATRIA" => 2,
-      "CLINICA_MEDICA" => 1
-    },
-    "CODEINA" => Map {
-      "PEDIATRIA" => 3,
-      "CLINICA_MEDICA" => 2
-    },
-    "INSULINA" => Map {
-      "ENDOCRINOLOGIA" => 1
-    }
-  }
-  ```
-
-2. **RCTA limpios:**
-   ```typescript
-   cleanRcta = Set {
-     "PARACETAMOL",
-     "CODEINA",
-     "PARACETAMOL+CODEINA",
-     "INSULINA"
-   }
-   ```
-
-3. **Especialidades:**
-   ```typescript
-   specialties = Set {
-     "PEDIATRIA",
-     "CLINICA_MEDICA",
-     "ENDOCRINOLOGIA"
-   }
-   ```
-
-4. **Mapeo para "PARACETAMOL":**
-   - `PEDIATRIA`: Score directo = 2 ✓
-   - `CLINICA_MEDICA`: Score directo = 1 ✓
-   - `ENDOCRINOLOGIA`: No hay score → 0
-
-5. **Mapeo para "PARACETAMOL+CODEINA":**
-   - `PEDIATRIA`: 
-     - No hay score directo
-     - Separa: ["PARACETAMOL", "CODEINA"]
-     - PARACETAMOL + PEDIATRIA = 2
-     - CODEINA + PEDIATRIA = 3
-     - Mínimo = 2 ✓
-   - `CLINICA_MEDICA`:
-     - No hay score directo
-     - Separa: ["PARACETAMOL", "CODEINA"]
-     - PARACETAMOL + CLINICA_MEDICA = 1
-     - CODEINA + CLINICA_MEDICA = 2
-     - Mínimo = 1 ✓
-
-#### Output
-
-**Archivo `rcta-to-specialty.json`:**
-```json
-{
-  "PARACETAMOL": {
-    "PEDIATRIA": 2,
-    "CLINICA_MEDICA": 1,
-    "ENDOCRINOLOGIA": 0
-  },
-  "CODEINA": {
-    "PEDIATRIA": 3,
-    "CLINICA_MEDICA": 2,
-    "ENDOCRINOLOGIA": 0
-  },
-  "PARACETAMOL+CODEINA": {
-    "PEDIATRIA": 2,
-    "CLINICA_MEDICA": 1,
-    "ENDOCRINOLOGIA": 0
-  },
-  "INSULINA": {
-    "PEDIATRIA": 0,
-    "CLINICA_MEDICA": 0,
-    "ENDOCRINOLOGIA": 1
-  }
-}
-```
-
-### Uso Posterior del Archivo Generado
-
-Este JSON es consumido por el analizador `drug-specialty` (`src/analyses/recipes/drug-specialty/index.ts`):
-
-1. **Cuando se analiza una receta:**
-   - Se extrae la especialidad del médico
-   - Se extrae el RCTA del medicamento prescrito
-   - Se consulta el score en `rcta-to-specialty.json`
-
-2. **Decisión:**
-   - Score 1-2: Válido (común)
-   - Score 3: Revisar (poco común pero puede ser legítimo)
-   - Score 4-5: Sospechoso (requiere revisión)
-
-3. **Ejemplo de uso:**
-   ```typescript
-   // En drug-specialty/index.ts
-   const specialty = recipe.physician.professional.license.specialty; // "PEDIATRIA"
-   const drug = recipe.medical.medicine[0].drug.name; // "PARACETAMOL+CODEINA"
-   
-   const score = rctaToSpecialty.get(drug)?.get(specialty); // 2
-   
-   if (score >= 4) {
-     // Marcar como sospechoso
-   }
-   ```
-
----
-
-## Flujo Completo del Sistema
-
-### 1. Entrada: Recetas Médicas
-
-Las recetas pueden venir de diferentes fuentes:
-- **OSPSA**: Obra Social de Personal de la Actividad
-- **MisRX**: Sistema de recetas electrónicas
-- **RCTA**: API de códigos terapéuticos
-
-Cada receta contiene:
-- Información del paciente (edad, sexo, diagnóstico)
-- Información del médico (especialidad, matrícula)
-- Medicamentos prescritos (nombre, dosis, cantidad)
-- Información de dispensación (farmacia, precio, fecha)
-
-### 2. Parsing: Conversión a Estructura Unificada
-
-Los parsers (`OspsaParser`, `MisRXParser`, `RctaParser`) convierten las recetas a una estructura común `Recipe`:
-
-```typescript
-type Recipe = {
-  patient: PatientInformation;
-  physician: PhysicianInformation;
-  medical: MedicalInformation;
-  dispensing: DispensingInformation;
+registry.getAllKeys().flatMap((key: number): [string, string][] => {
+  const entry: AlfaBetaTimeSeries = registry.getTimeSeries(key) as AlfaBetaTimeSeries;
   // ...
-};
+})
 ```
 
-### 3. Normalización
+**¿Qué hace `flatMap`?**
+- Itera sobre cada `key` del array
+- Para cada `key`, obtiene el `AlfaBetaTimeSeries` correspondiente
+- Cada iteración puede devolver un array de tuplas `[string, string][]`
+- `flatMap` "aplana" todos estos arrays en un solo array
 
-- Nombres de medicamentos se normalizan a RCTA
-- Diagnósticos se normalizan a ICD-10
-- Especialidades se normalizan a formato estándar
+**Ejemplo:**
+```typescript
+// Si tenemos 3 productos:
+// Producto 1 devuelve: [["droga1", "ATC1"], ["droga1", "ATC2"]]
+// Producto 2 devuelve: [["droga2", "ATC3"]]
+// Producto 3 devuelve: [["droga3", "ATC4"], ["droga3", "ATC5"]]
 
-### 4. Análisis con Múltiples Scorers
+// flatMap los combina en:
+[
+  ["droga1", "ATC1"],
+  ["droga1", "ATC2"],
+  ["droga2", "ATC3"],
+  ["droga3", "ATC4"],
+  ["droga3", "ATC5"]
+]
+```
 
-El sistema ejecuta múltiples analizadores en etapas:
+**Tipo de retorno:** `[string, string][]` (array de tuplas [componente, códigoATC])
 
-#### Etapa 1: Validaciones Básicas
-- `drug-diagnosis`: ¿Medicamento corresponde al diagnóstico?
-- `drug-specialty`: ¿Especialidad suele prescribir este medicamento?
-- `drug-drug`: ¿Hay interacciones peligrosas?
-- `drug-price`: ¿El precio es razonable?
-- `drug-units`: ¿Las unidades son correctas?
-- Y más...
+### Paso 4: Obtener Todos los Momentos Temporales
 
-#### Etapa 2: Validaciones de Consistencia
-- `dispense-match-prescribed-price`: ¿Precio dispensado = precio prescrito?
-- `dispense-match-prescribed-dosage`: ¿Dosificación dispensada = dosificación prescrita?
+```typescript
+Array.from([...entry.atcCodes.allMoments, ...entry.components.allMoments], ...)
+```
 
-#### Etapa 3: Detección de Patrones Sospechosos (Prescripción)
-- `suspicion-prescribed`: Detecta patrones anómalos en la prescripción
+**¿Qué hace?**
+- Combina todos los momentos (fechas) donde hay códigos ATC definidos
+- Combina todos los momentos donde hay componentes definidos
+- Usa el spread operator (`...`) para combinar ambos arrays
+- `Array.from` crea un nuevo array iterando sobre estos momentos
 
-#### Etapa 4: Detección de Patrones Sospechosos (Dispensación)
-- `suspicion-dispensed`: Detecta patrones anómalos en la dispensación
+**Ejemplo:**
+```typescript
+// Si entry.atcCodes.allMoments = [Date1, Date2]
+// Y entry.components.allMoments = [Date1, Date3]
 
-### 5. Resultados
+// Resultado: [Date1, Date2, Date1, Date3]
+// (puede haber duplicados, pero se procesan todos)
+```
 
-Cada receta recibe:
-- **Score general**: Número que indica nivel de sospecha
-- **Metadatos**: Detalles de cada validación
-- **Missing data**: Información faltante que impidió validaciones
+**Tipo de retorno:** `[Set<string> | undefined, string[] | undefined][]`
 
-### 6. Reportes
+### Paso 5: Mapear Cada Momento a sus Datos
 
-Se generan reportes por:
-- **Paciente**: Todas las recetas de un paciente
-- **Médico**: Todas las recetas de un médico
-- **Farmacia**: Todas las recetas dispensadas en una farmacia
+```typescript
+(moment: Date): [Set<string> | undefined, string[] | undefined] => [
+  entry.atcCodes.lookup(moment),
+  entry.components.lookup(moment)?.map(({ drug }: AlfaBetaComponent): string => drug),
+]
+```
 
----
+**¿Qué hace?**
+- Para cada momento (fecha), busca:
+  1. Los códigos ATC en esa fecha: `entry.atcCodes.lookup(moment)` → `Set<string> | undefined`
+  2. Los componentes en esa fecha: `entry.components.lookup(moment)` → `AlfaBetaComponent[] | undefined`
+- Extrae solo el nombre de la droga de cada componente: `.map(({ drug }) => drug)`
 
-## Ejemplos Prácticos
+**Ejemplo:**
+```typescript
+// Para un momento específico:
+// entry.atcCodes.lookup(moment) → Set(["A01AA01", "A01AA02"])
+// entry.components.lookup(moment) → [
+//   { drug: "Paracetamol", ... },
+//   { drug: "Ibuprofeno", ... }
+// ]
 
-### Ejemplo 1: Detección de Medicamento sin Diagnóstico
+// Después del map:
+// ["Paracetamol", "Ibuprofeno"]
 
-**Receta:**
-```json
-{
-  "patient": {
-    "diagnosis": []  // Sin diagnóstico
-  },
-  "medicine": [
-    {
-      "drug": { "name": "INSULINA" }
-    }
+// Resultado de la tupla:
+// [Set(["A01AA01", "A01AA02"]), ["Paracetamol", "Ibuprofeno"]]
+```
+
+**Tipo de retorno:** `[Set<string> | undefined, string[] | undefined][]`
+
+### Paso 6: Filtrar Pares Válidos
+
+```typescript
+.filter(
+  (pair: [Set<string> | undefined, string[] | undefined]): pair is [Set<string>, string[]] =>
+    undefined !== pair[0] && undefined !== pair[1] && 0 < pair[0].size && 0 < pair[1].length,
+)
+```
+
+**¿Qué hace?**
+- Elimina pares donde:
+  - Los códigos ATC son `undefined`
+  - Los componentes son `undefined`
+  - Los códigos ATC están vacíos (`size === 0`)
+  - Los componentes están vacíos (`length === 0`)
+- Usa un type guard para asegurar que después del filtro, ambos valores están definidos
+
+**Ejemplo:**
+```typescript
+// Antes del filter:
+[
+  [Set(["A01AA01"]), ["Paracetamol"]],  // ✅ Válido
+  [undefined, ["Ibuprofeno"]],            // ❌ Filtrado (ATC undefined)
+  [Set([]), ["Aspirina"]],                // ❌ Filtrado (ATC vacío)
+  [Set(["A01AA02"]), []],                 // ❌ Filtrado (componentes vacíos)
+  [Set(["A01AA03"]), ["Diclofenac"]]      // ✅ Válido
+]
+
+// Después del filter:
+[
+  [Set(["A01AA01"]), ["Paracetamol"]],
+  [Set(["A01AA03"]), ["Diclofenac"]]
+]
+```
+
+**Tipo de retorno:** `[Set<string>, string[]][]` (solo pares válidos)
+
+### Paso 7: `flatMap` para Generar Combinaciones
+
+```typescript
+.flatMap(([atcCodes, components]: [Set<string>, string[]]): [string, string][] => {
+  const normalizedAtcCodes: string[] = Array.from(atcCodes.values(), (atcCode: string): string =>
+    atcCode.toUpperCase(),
+  );
+  return array_cartesian(components, normalizedAtcCodes);
+})
+```
+
+**¿Qué hace?**
+1. **Normaliza códigos ATC**: Convierte todos los códigos ATC a mayúsculas
+2. **Genera producto cartesiano**: Crea todas las combinaciones posibles entre componentes y códigos ATC
+
+**¿Qué es `array_cartesian`?**
+```typescript
+array_cartesian(components, normalizedAtcCodes)
+// Si components = ["Paracetamol", "Ibuprofeno"]
+// Y normalizedAtcCodes = ["A01AA01", "A01AA02"]
+// Resultado:
+[
+  ["Paracetamol", "A01AA01"],
+  ["Paracetamol", "A01AA02"],
+  ["Ibuprofeno", "A01AA01"],
+  ["Ibuprofeno", "A01AA02"]
+]
+```
+
+**Ejemplo completo:**
+```typescript
+// Entrada:
+[Set(["a01aa01", "A01AA02"]), ["Paracetamol", "Ibuprofeno"]]
+
+// Paso 1: Normalizar ATC
+normalizedAtcCodes = ["A01AA01", "A01AA02"]
+
+// Paso 2: Producto cartesiano
+[
+  ["Paracetamol", "A01AA01"],
+  ["Paracetamol", "A01AA02"],
+  ["Ibuprofeno", "A01AA01"],
+  ["Ibuprofeno", "A01AA02"]
+]
+```
+
+**Tipo de retorno:** `[string, string][]` (array de tuplas [componente, códigoATC])
+
+### Paso 8: `array_categorize` - Agrupar por Componente
+
+```typescript
+array_categorize(
+  [...todas las tuplas [string, string]...],
+  ([drug]: [string, string]): string => drug,
+)
+```
+
+**¿Qué hace `array_categorize`?**
+- Toma un array y una función categorizadora
+- Agrupa los elementos del array por la categoría que devuelve la función
+- Devuelve un `Map` donde:
+  - **Clave**: La categoría (en este caso, el nombre del componente)
+  - **Valor**: Array de todos los elementos que pertenecen a esa categoría
+
+**Ejemplo:**
+```typescript
+// Entrada (array de tuplas):
+[
+  ["Paracetamol", "A01AA01"],
+  ["Paracetamol", "A01AA02"],
+  ["Ibuprofeno", "A01AA01"],
+  ["Ibuprofeno", "A01AA02"],
+  ["Paracetamol", "A01AA03"]
+]
+
+// Después de array_categorize:
+Map {
+  "Paracetamol" => [
+    ["Paracetamol", "A01AA01"],
+    ["Paracetamol", "A01AA02"],
+    ["Paracetamol", "A01AA03"]
+  ],
+  "Ibuprofeno" => [
+    ["Ibuprofeno", "A01AA01"],
+    ["Ibuprofeno", "A01AA02"]
   ]
 }
 ```
 
-**Análisis:**
-1. `drug-diagnosis` detecta: INSULINA sin diagnóstico
-2. Resultado: **Categoría 2** (muy sospechoso)
-3. Mensaje: "Medicación sin diagnóstico respaldatorio, consultar médico"
+**Tipo de retorno:** `Map<string, [string, string][]>`
 
-### Ejemplo 2: Detección de Especialidad Incorrecta
+### Paso 9: `map_map` - Transformar Arrays en Sets
 
-**Receta:**
-```json
-{
-  "physician": {
-    "professional": {
-      "license": {
-        "specialty": "PEDIATRIA"
-      }
-    }
-  },
-  "medicine": [
-    {
-      "drug": { "name": "WARFARINA" }  // Anticoagulante típico de cardiología
-    }
+```typescript
+map_map(
+  Map<string, [string, string][]>,
+  (pairs: [string, string][]): Set<string> =>
+    new Set<string>(pairs.map(([, atcCode]: [string, string]): string => atcCode)),
+)
+```
+
+**¿Qué hace `map_map`?**
+- Toma un `Map<K, V>` y una función `f: (v: V) => U`
+- Transforma cada valor del mapa aplicando la función
+- Mantiene las mismas claves
+- Devuelve un `Map<K, U>`
+
+**En este caso:**
+- **Entrada**: `Map<string, [string, string][]>` (componente → array de tuplas)
+- **Función**: Extrae solo los códigos ATC de cada tupla y los convierte en un `Set`
+- **Salida**: `Map<string, Set<string>>` (componente → set de códigos ATC)
+
+**Ejemplo:**
+```typescript
+// Entrada:
+Map {
+  "Paracetamol" => [
+    ["Paracetamol", "A01AA01"],
+    ["Paracetamol", "A01AA02"],
+    ["Paracetamol", "A01AA03"]
+  ],
+  "Ibuprofeno" => [
+    ["Ibuprofeno", "A01AA01"],
+    ["Ibuprofeno", "A01AA02"]
   ]
+}
+
+// Para "Paracetamol":
+pairs.map(([, atcCode]) => atcCode)
+// → ["A01AA01", "A01AA02", "A01AA03"]
+// new Set(...) → Set(["A01AA01", "A01AA02", "A01AA03"])
+
+// Resultado final:
+Map {
+  "Paracetamol" => Set(["A01AA01", "A01AA02", "A01AA03"]),
+  "Ibuprofeno" => Set(["A01AA01", "A01AA02"])
 }
 ```
 
-**Análisis:**
-1. `drug-specialty` consulta: `rcta-to-specialty.json`
-2. WARFARINA + PEDIATRIA = score 5
-3. Resultado: **Muy sospechoso** - requiere revisión
-4. Mensaje: "Combinación especialidad y medicamento/os, requiere revisión"
+**Tipo de retorno:** `Map<string, Set<string>>`
 
-### Ejemplo 3: Detección de Interacción Peligrosa
-
-**Receta:**
-```json
-{
-  "medicine": [
-    {
-      "drug": { "name": "WARFARINA" }  // Anticoagulante
-    },
-    {
-      "drug": { "name": "IBUPROFENO" }  // Antiinflamatorio
-    }
-  ]
-}
-```
-
-**Análisis:**
-1. `drug-drug` detecta: WARFARINA + IBUPROFENO = interacción peligrosa
-2. Resultado: **Muy sospechoso**
-3. Mensaje: "Interacción peligrosa detectada - riesgo de sangrado"
-
-### Ejemplo 4: Medicamento Compuesto
-
-**Receta:**
-```json
-{
-  "physician": {
-    "professional": {
-      "license": {
-        "specialty": "PEDIATRIA"
-      }
-    }
-  },
-  "medicine": [
-    {
-      "drug": { "name": "PARACETAMOL+CODEINA" }
-    }
-  ]
-}
-```
-
-**Análisis:**
-1. `drug-specialty` consulta: `rcta-to-specialty.json`
-2. No encuentra score directo para "PARACETAMOL+CODEINA"
-3. Separa: ["PARACETAMOL", "CODEINA"]
-4. Busca:
-   - PARACETAMOL + PEDIATRIA = 2
-   - CODEINA + PEDIATRIA = 3
-5. Toma mínimo: 2
-6. Resultado: **Válido** (score 2 = frecuente)
-
----
-
-## Resumen
-
-### ¿Por qué estos matcheos?
-
-Los matcheos entre drogas, códigos ICD-10, especialidades, componentes, etc. permiten:
-
-1. **Validar coherencia médica**: Un medicamento debe corresponder al diagnóstico
-2. **Detectar especialidades incorrectas**: Un médico debe prescribir medicamentos de su especialidad
-3. **Prevenir interacciones peligrosas**: Algunas combinaciones de medicamentos son peligrosas
-4. **Normalizar datos**: Diferentes nombres comerciales deben tratarse como el mismo medicamento
-5. **Detectar fraudes**: Patrones anómalos pueden indicar fraude
-
-### ¿Cómo funciona `rcta-to-specialty`?
-
-1. **Carga datos** de especialidades y medicamentos de OSOSS
-2. **Obtiene RCTA limpios** de un dataset procesado
-3. **Mapea cada RCTA a especialidades** con scores (1-5)
-4. **Maneja RCTA compuestos** separándolos y tomando el score mínimo
-5. **Genera JSON** que será usado por el analizador `drug-specialty`
-
-### Flujo de Datos
+## Resumen del Flujo Completo
 
 ```
-specialty-medications-ososs.csv
-    ↓
-drugNameToSpecialtyToScore (Map)
-    ↓
-rcta-composed-to-rcta-composed-clean.csv
-    ↓
-cleanRcta (Set)
-    ↓
-rctaToSpecialty (Map) ← Cálculo con lógica de compuestos
-    ↓
-rcta-to-specialty.json
-    ↓
-drug-specialty/index.ts (Analizador)
-    ↓
-Score de sospecha en recetas
+1. registry.getAllKeys()
+   → [1, 2, 3, ...] (números)
+
+2. .flatMap(key => ...)
+   → Para cada producto, genera tuplas [componente, ATC]
+   → Resultado: [["Paracetamol", "A01AA01"], ["Paracetamol", "A01AA02"], ...]
+
+3. array_categorize(..., drug => drug)
+   → Agrupa por componente
+   → Resultado: Map { "Paracetamol" => [[...tuplas...]], ... }
+
+4. map_map(..., pairs => Set de ATCs)
+   → Convierte arrays de tuplas en Sets de códigos ATC
+   → Resultado: Map { "Paracetamol" => Set(["A01AA01", ...]), ... }
 ```
 
----
+## Funciones Auxiliares Utilizadas
 
-## Referencias
+### `flatMap`
+- **Propósito**: Aplana arrays anidados
+- **Ejemplo**: `[1, 2].flatMap(x => [x, x*2])` → `[1, 2, 2, 4]`
 
-- **RCTA**: Registro de Códigos Terapéuticos Argentinos
-- **ICD-10**: Clasificación Internacional de Enfermedades, 10ª Revisión
-- **ATC**: Anatomical Therapeutic Chemical Classification System
-- **OSOSS**: Obra Social (fuente de datos de especialidades)
-- **OSPSA**: Obra Social de Personal de la Actividad
+### `array_cartesian`
+- **Propósito**: Genera el producto cartesiano de dos arrays
+- **Implementación**: `arrayA.flatMap(a => arrayB.map(b => [a, b]))`
+- **Ejemplo**: `array_cartesian([1, 2], [3, 4])` → `[[1, 3], [1, 4], [2, 3], [2, 4]]`
 
----
+### `array_categorize`
+- **Propósito**: Agrupa elementos de un array por categoría
+- **Implementación**: Itera sobre el array y agrupa en un Map
+- **Ejemplo**: `array_categorize([1, 2, 3, 4], x => x % 2)` → `Map { 0 => [2, 4], 1 => [1, 3] }`
 
-*Documento generado para explicar el sistema de detección de fraude farmacéutico*
+### `map_map`
+- **Propósito**: Transforma los valores de un Map
+- **Implementación**: `new Map(Array.from(map.entries(), ([k, v]) => [k, f(v)]))`
+- **Ejemplo**: `map_map(Map { "a" => 1, "b" => 2 }, x => x * 2)` → `Map { "a" => 2, "b" => 4 }`
+
+## Resultado Final
+
+El resultado es un `Map<string, Set<string>>` donde:
+- Cada clave es el nombre de un componente (droga)
+- Cada valor es un Set de códigos ATC asociados a ese componente
+- Los códigos ATC están normalizados (mayúsculas)
+- Un componente puede tener múltiples códigos ATC (porque puede aparecer en diferentes productos o momentos temporales)
+
+Este mapa se utiliza posteriormente para traducir nombres de componentes a sus códigos ATC correspondientes.
 
