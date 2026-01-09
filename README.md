@@ -1,384 +1,417 @@
-# Explicación del Código: `componentToAtc`
+# Explicación del Sistema SISA (Sistema Integrado de Información Sanitaria Argentina)
 
-Este documento explica en detalle cómo funciona la función `componentToAtc` y cómo se transforman los datos paso a paso.
+Este documento explica la estructura y funcionamiento del sistema de integración con la API de SISA (sisa.msal.gov.ar), que permite descargar y procesar información de profesionales de la salud registrados en Argentina.
 
-## Objetivo
+## Estructura General
 
-La función `componentToAtc` crea un mapa que relaciona cada componente (droga/fármaco) con sus códigos ATC (Anatomical Therapeutic Chemical) correspondientes. El resultado es un `Map<string, Set<string>>` donde:
-- **Clave**: Nombre del componente (droga)
-- **Valor**: Set de códigos ATC asociados a ese componente
+El sistema está dividido en dos partes principales:
 
-## Estructura de Datos Inicial
+1. **Datasources** (`src/datasources/sisa.msal.gov.ar`): Se encarga de **descargar** los datos desde la API de SISA
+2. **Datasets** (`src/datasets/sisa.msal.gov.ar`): Se encarga de **procesar y transformar** los datos descargados
 
-### `AlfaBetaRegistry`
+---
 
-El `AlfaBetaRegistry` es un registro que contiene información temporal de productos farmacéuticos. Cada producto tiene:
+## 📥 Datasources (Descarga de Datos)
 
-- **`key`**: Un número identificador único del producto
-- **`atcCodes`**: Una serie temporal (`TimeSeries`) que contiene los códigos ATC del producto en diferentes momentos
-- **`components`**: Una serie temporal que contiene los componentes (drogas) del producto en diferentes momentos
+### Propósito
+Los datasources son responsables de obtener los datos crudos desde la API de SISA y guardarlos en caché local para su posterior procesamiento.
 
-### `AlfaBetaTimeSeries`
+### Archivos
 
-Cada entrada del registro es un `AlfaBetaTimeSeries` que contiene:
-- `atcCodes.allMoments`: Array de fechas donde hay códigos ATC definidos
-- `atcCodes.lookup(moment)`: Función que devuelve un `Set<string>` con los códigos ATC para una fecha específica
-- `components.allMoments`: Array de fechas donde hay componentes definidos
-- `components.lookup(moment)`: Función que devuelve un array de `AlfaBetaComponent` para una fecha específica
+#### `index.ts` - Punto de Entrada Principal
+Este archivo es el punto de entrada para descargar datos históricos. Su función es:
 
-## Transformación Paso a Paso
+- **Validar variables de entorno**: Verifica que estén definidas:
+  - `SISA_API`: URL base de la API de SISA
+  - `SISA_USER`: Usuario para autenticación
+  - `SISA_PASSWORD`: Contraseña para autenticación
 
-### Paso 1: Cargar el Registro
+- **Descargar datos en dos modos**:
+  1. **Modo "Registro"**: Descarga profesionales registrados por primera vez
+  2. **Modo "Modificacion"**: Descarga profesionales que han sido modificados
 
+**Flujo de ejecución:**
 ```typescript
-const registry: AlfaBetaRegistry = AlfaBetaRegistry.load();
+await downloadFrom(API_BASE, USERNAME, PASSWORD, 'Registro');
+await downloadFrom(API_BASE, USERNAME, PASSWORD, 'Modificacion');
 ```
 
-**¿Qué contiene `registry`?**
-- Un mapa interno de productos farmacéuticos
-- Cada producto tiene información temporal (cambios a lo largo del tiempo)
-- Puede contener miles de productos
+#### `historico.ts` - Descarga Histórica por Fechas
+Este módulo implementa la lógica para descargar datos día por día desde una fecha inicial hasta la fecha actual.
 
-**Estructura conceptual:**
+**Funcionalidades principales:**
+
+1. **`getStartDate(mode: Modo)`**: 
+   - Determina la fecha de inicio para la descarga
+   - Busca en el caché local (`cache/sisa.msal.gov.ar/sisa/services/rest/profesional`) la última fecha descargada
+   - Si no encuentra nada, usa la fecha por defecto: `2010-08-28`
+   - Esto permite reanudar descargas interrumpidas sin duplicar datos
+
+2. **`downloadFrom(apiBase, username, password, mode)`**:
+   - Crea un `Getter` con configuración específica:
+     - Timeout de 500ms
+     - Tamaño máximo de respuesta: 200
+     - Headers: `Content-Type: application/json`
+     - Parámetros a excluir del caché: `fechaModificacionHasta`, `clave`, `usuario`
+   
+   - **Bucle de descarga diaria**:
+     - Itera día por día desde `getStartDate()` hasta la fecha actual
+     - Para cada día, construye una URL con parámetros:
+       - `fechaRegistroDesde` / `fechaModificacionDesde`: Fecha del día
+       - `fechaRegistroHasta` / `fechaModificacionHasta`: Misma fecha (rango de un día)
+       - `clave`: Contraseña
+       - `usuario`: Usuario
+     
+     - **Manejo de cuota diaria**:
+       - Si la respuesta contiene `QUOTA_DIARIA_EXCEDIDA`, lanza una excepción `DailyQuotaExceeded`
+       - Elimina el archivo de caché parcial si existe
+       - Detiene el proceso de descarga
+     
+     - **Manejo de errores**: Registra errores pero continúa con el siguiente día
+
+3. **Clase `DailyQuotaExceeded`**: 
+   - Error personalizado que se lanza cuando se excede la cuota diaria de la API
+
+**Endpoint utilizado:**
 ```
-registry = {
-  key1: AlfaBetaTimeSeries {
-    atcCodes: TimeSeries<Set<string>>,
-    components: TimeSeries<AlfaBetaComponent[]>
-  },
-  key2: AlfaBetaTimeSeries { ... },
-  ...
-}
-```
-
-### Paso 2: Obtener Todas las Claves
-
-```typescript
-registry.getAllKeys()
-```
-
-**¿Qué devuelve?**
-- Un array de números: `number[]`
-- Ejemplo: `[1, 2, 3, 4, 5, ...]`
-- Cada número es un identificador único de un producto farmacéutico
-
-**Tipo de retorno:** `number[]`
-
-### Paso 3: `flatMap` sobre las Claves
-
-```typescript
-registry.getAllKeys().flatMap((key: number): [string, string][] => {
-  const entry: AlfaBetaTimeSeries = registry.getTimeSeries(key) as AlfaBetaTimeSeries;
-  // ...
-})
-```
-
-**¿Qué hace `flatMap`?**
-- Itera sobre cada `key` del array
-- Para cada `key`, obtiene el `AlfaBetaTimeSeries` correspondiente
-- Cada iteración puede devolver un array de tuplas `[string, string][]`
-- `flatMap` "aplana" todos estos arrays en un solo array
-
-**Ejemplo:**
-```typescript
-// Si tenemos 3 productos:
-// Producto 1 devuelve: [["droga1", "ATC1"], ["droga1", "ATC2"]]
-// Producto 2 devuelve: [["droga2", "ATC3"]]
-// Producto 3 devuelve: [["droga3", "ATC4"], ["droga3", "ATC5"]]
-
-// flatMap los combina en:
-[
-  ["droga1", "ATC1"],
-  ["droga1", "ATC2"],
-  ["droga2", "ATC3"],
-  ["droga3", "ATC4"],
-  ["droga3", "ATC5"]
-]
+GET {API_BASE}/profesional/buscar?fecha{Modo}Desde={fecha}&fecha{Modo}Hasta={fecha}&clave={password}&usuario={username}
 ```
 
-**Tipo de retorno:** `[string, string][]` (array de tuplas [componente, códigoATC])
+#### `nominal.ts` - Consulta de Profesional Específico
+Este archivo es un script de prueba/ejemplo que muestra cómo obtener información de un profesional específico por su número de documento.
 
-### Paso 4: Obtener Todos los Momentos Temporales
+**Características:**
+- Consulta un profesional específico usando el número de documento: `28824751`
+- Utiliza el endpoint `/profesional/obtener` en lugar de `/profesional/buscar`
+- Parámetros: `nrodoc`, `clave`, `usuario`
+- Maneja el caso de "REGISTRO_NO_ENCONTRADO"
+- También maneja la excepción de cuota diaria excedida
 
-```typescript
-Array.from([...entry.atcCodes.allMoments, ...entry.components.allMoments], ...)
+**Endpoint utilizado:**
+```
+GET {API_BASE}/profesional/obtener?nrodoc={numero}&clave={password}&usuario={username}
 ```
 
-**¿Qué hace?**
-- Combina todos los momentos (fechas) donde hay códigos ATC definidos
-- Combina todos los momentos donde hay componentes definidos
-- Usa el spread operator (`...`) para combinar ambos arrays
-- `Array.from` crea un nuevo array iterando sobre estos momentos
+#### `utils.ts` - Utilidades de Formato
+Contiene funciones auxiliares para formatear fechas:
 
-**Ejemplo:**
-```typescript
-// Si entry.atcCodes.allMoments = [Date1, Date2]
-// Y entry.components.allMoments = [Date1, Date3]
+- **`toSisaDate(date: Date)`**: 
+  - Convierte un objeto `Date` a formato de fecha que espera la API de SISA
+  - Formato: `DD/MM/YYYY` (ejemplo: `28/08/2010`)
 
-// Resultado: [Date1, Date2, Date1, Date3]
-// (puede haber duplicados, pero se procesan todos)
+---
+
+## 📊 Datasets (Procesamiento de Datos)
+
+### Propósito
+Los datasets procesan los datos descargados, los transforman a estructuras tipadas, los validan y generan archivos de salida en diferentes formatos (JSON, CSV).
+
+### Archivos
+
+#### `index.ts` - Procesamiento y Merge Principal
+Este es el punto de entrada para procesar los datos descargados.
+
+**Flujo de procesamiento:**
+
+1. **Carga de datos desde caché**:
+   ```typescript
+   const profesionalesReg = fromCacheSisa(API_BASE, 'Registro');
+   const profesionalesMod = fromCacheSisa(API_BASE, 'Modificacion');
+   ```
+   - Carga profesionales de ambos modos (Registro y Modificación)
+   - Cada uno retorna un `Map<string, Profesional>` donde la clave es un ID único
+
+2. **Merge de profesionales**:
+   ```typescript
+   const mergedProfessionals = mergeProfesionales([
+     ...profesionalesReg.values(),
+     ...profesionalesMod.values(),
+   ]);
+   ```
+   - Combina ambos conjuntos de profesionales
+   - La función `mergeProfesionales` elimina duplicados y mantiene la versión más reciente
+
+3. **Generación de archivos de salida**:
+   - **JSON**: `out/professionals-merged.json`
+   - **CSV**: `out/professionals-merged.csv`
+
+#### `historico.ts` - Lectura y Procesamiento desde Caché
+Este módulo lee los archivos descargados del caché y los transforma a objetos tipados.
+
+**Función principal: `fromCacheSisa(apiBase, mode)`**
+
+**Proceso:**
+
+1. **Iteración por fechas**:
+   - Itera desde `FIRST_START_DATE` (28/08/2010) hasta la fecha actual
+   - Para cada fecha, construye la URL que se usó para descargar
+
+2. **Lectura y transformación**:
+   - Usa `CacheGetter` para leer archivos del caché
+   - Convierte XML a JSON usando `xml2json`
+   - Aplica la función `simplify()` para limpiar la estructura XML anidada
+   - Valida que el resultado sea `OK`
+
+3. **Procesamiento de profesionales**:
+   - Maneja casos donde hay:
+     - **Múltiples profesionales**: Array de profesionales
+     - **Un solo profesional**: Objeto único
+     - **Sin profesionales**: Resultado vacío
+   
+   - Para cada profesional:
+     - Parsea usando `parseProfesional()`
+     - Genera un ID único con `idForProfesional()`
+     - Si el ID ya existe, lo ignora (evita duplicados)
+     - Almacena en un `Map<string, Profesional>`
+
+4. **Guardado intermedio**:
+   - Guarda los profesionales procesados en:
+     - `out/sisa-profesionales.json` (para modo Registro)
+     - `out/sisa-profesionales-modificacion.json` (para modo Modificación)
+
+5. **Retorno**: Devuelve el `Map` con todos los profesionales procesados
+
+#### `nominal.ts` - Prueba de Consulta Individual
+Similar al `nominal.ts` de datasources, pero procesa la respuesta:
+
+- Lee del caché la respuesta de `/profesional/obtener`
+- Convierte XML a JSON
+- Parsea el profesional usando `parseProfesional()`
+- Muestra el resultado en consola
+
+#### `types.ts` - Definiciones de Tipos TypeScript
+Define todas las estructuras de datos utilizadas:
+
+**Enums:**
+- **`Estado`**: Estados de una matrícula
+  - `'baja definitiva'`
+  - `'baja temporal'`
+  - `'habilitado'`
+  - `'inhabilitacion por rematriculacion'`
+
+- **`Provincia`**: Provincias argentinas con sus IDs numéricos (1-24)
+
+- **`TipoDocumento`**: Tipos de documento de identidad
+  - `'ci'`, `'de'`, `'dni'`, `'dnim'`, `'lc'`, `'le'`
+
+**Types:**
+
+1. **`Especialidad`**: Información de una especialidad médica
+   - `especialidad`: Nombre de la especialidad
+   - `establecimiento`: Establecimiento donde se certificó (opcional)
+   - `fechaCertificacion`: Fecha de certificación
+   - `idEspecialidad`, `idEspecialidadMod`: IDs numéricos
+   - `ministerio`: Ministerio que certificó (opcional)
+   - `nroCertificacion`: Número de certificación (opcional)
+   - `sociedadCientifica`: Sociedad científica (opcional)
+   - `tipoCertificacion`: Tipo de certificación
+
+2. **`Matricula`**: Información de una matrícula profesional
+   - `especialidades`: Array de especialidades
+   - `estado`: Estado de la matrícula (opcional)
+   - `fechaMatricula`, `fechaModificacion`, `fechaRegistro`, `fechaTitulo`: Fechas relevantes
+   - `idInstitucionFormadora`, `idJurisdiccion`, `idProfesion`, `idProfesionalMatricula`: IDs numéricos
+   - `institucionFormadora`, `jurisdiccion`, `profesion`: Nombres
+   - `matricula`: Número de matrícula
+   - `observaciones`: Observaciones (opcional)
+   - `provincia`: Provincia de la matrícula
+
+3. **`Profesional`**: Información completa de un profesional
+   - `apellido`, `nombre`: Datos personales
+   - `codigo`: Código único del profesional
+   - `cuit`: CUIT (opcional)
+   - `fechaModificacion`, `fechaRegistro`: Fechas de registro/modificación
+   - `idProfesional`: ID numérico
+   - `matriculas`: Array de matrículas
+   - `numeroDocumento`: Número de documento
+   - `sss`: Información del Sistema de Seguimiento de Salud (opcional)
+   - `tipoDocumento`: Tipo de documento
+
+4. **`SssInfo`**: Información del Sistema de Seguimiento de Salud
+   - `certificado`: Número de certificado
+   - `fecha`, `fechaFin`: Fechas de vigencia
+
+#### `utils.ts` - Utilidades de Procesamiento
+Este archivo contiene la mayor parte de la lógica de transformación y validación.
+
+**Funciones de Identificación:**
+
+1. **`idForProfesional(prof)`**: Genera un ID único para un profesional
+   - Formato: `{tipoDocumento}:{numeroDocumento}:{codigo}:{idProfesional}`
+
+2. **`idForMatriculas(mat)`**: Genera un ID único para una matrícula
+   - Formato: `{idProfesionalMatricula}:{idProfesion}:{idJurisdiccion}:{matricula}`
+
+3. **`idForEspecialidades(esp)`**: Genera un ID único para una especialidad
+   - Formato: `{fechaCertificacion}:{especialidad}:{ministerio}:{nroCertificacion}:{idEspecialidad}`
+
+**Funciones de Parsing:**
+
+1. **`parseEspecialidad(data)`**: 
+   - Valida y parsea datos de una especialidad
+   - Normaliza textos
+   - Convierte fechas de formato `DD/MM/YYYY` a objetos `Date`
+
+2. **`parseMatricula(data)`**:
+   - Valida y parsea datos de una matrícula
+   - Maneja especialidades (puede ser array, objeto único, o undefined)
+   - Valida que la provincia coincida con su ID
+   - Convierte fechas en diferentes formatos:
+     - `DD-MM-YYYY HH:mm` para `fechaMatricula`
+     - `DD-MM-YYYY` para `fechaRegistro`, `fechaModificacion`
+   - Normaliza observaciones (puede ser string o objeto)
+
+3. **`parseProfesional(data)`**:
+   - Valida y parsea datos de un profesional completo
+   - Procesa matriculas (puede ser array, objeto único, o undefined)
+   - Construye el objeto `sss` con información opcional
+   - Valida que el tipo de documento sea válido
+
+**Funciones de Transformación:**
+
+1. **`simplify(data)`**:
+   - Limpia la estructura JSON resultante de convertir XML
+   - Elimina objetos vacíos
+   - Simplifica estructuras anidadas innecesarias (cuando hay un solo hijo)
+   - Elimina propiedades que empiezan con `_` (metadatos XML)
+
+**Funciones de Validación de Tipos:**
+
+- `isString()`, `isNumber()`, `isArray()`, `isObject()`, `isStringOrNumber()`
+- `isSlashDateString()`, `isDashDateString()`, `isDashDateTimeString()`: Validadores de formatos de fecha
+
+**Funciones de Conversión de Fechas:**
+
+1. **`slashDateStringToDate(str)`**: 
+   - Convierte `DD/MM/YYYY` a `Date`
+   - Maneja años de 2 dígitos (asume 1900-1999 si < 70, 2000-2099 si >= 70)
+   - Valida que la fecha sea correcta
+
+2. **`dashDateStringToDate(str)`**: 
+   - Convierte `DD-MM-YYYY` a `Date`
+
+3. **`dashDateTimeStringToDate(str)`**: 
+   - Convierte `DD-MM-YYYY HH:mm` a `Date`
+
+**Funciones de Merge (Eliminación de Duplicados):**
+
+1. **`merge<T>(subjects, id)`**:
+   - Función genérica que elimina duplicados basándose en un ID
+   - Cuando hay duplicados, mantiene el más reciente según:
+     1. `fechaModificacion` (más reciente primero)
+     2. Si son iguales, `fechaRegistro` (más reciente primero)
+     3. Si son iguales, `fechaCertificacion` (más reciente primero)
+
+2. **`mergeProfesionales(profesionales)`**:
+   - Merge de profesionales basado en `codigo`
+   - Para cada profesional, también hace merge de:
+     - **Matrículas**: Basado en `{idJurisdiccion}:{profesion}:{matricula}`
+     - **Especialidades**: Basado en `{idEspecialidad}:{idEspecialidadMod}`
+
+**Funciones de Exportación a CSV:**
+
+1. **`toPaths(subject, path)`**: 
+   - Convierte un objeto JSON anidado a un array de rutas y valores
+   - Ejemplo: `{a: {b: 1}}` → `[['a', 'b'], 1]`
+
+2. **`flatten(subject, separator)`**: 
+   - Aplana un objeto JSON usando un separador (por defecto `__`)
+   - Ejemplo: `{a: {b: 1}}` → `{'a__b': 1}`
+
+3. **`jsonArrayToCsv(subject, separator)`**: 
+   - Convierte un array de objetos JSON a formato CSV
+   - Retorna: `[filas, headers]`
+   - Headers ordenados por profundidad y alfabéticamente
+
+4. **`writeJsonArrayToCsv(filename, subject)`**: 
+   - Escribe un array JSON a un archivo CSV
+
+**Constantes:**
+
+- **`FIRST_START_DATE`**: Fecha inicial para procesamiento: `2010-08-28T00:00:00.000-03:00`
+
+---
+
+## 🔄 Flujo Completo del Sistema
+
+```
+1. DATASOURCES (Descarga)
+   │
+   ├─ index.ts ejecuta downloadFrom() para 'Registro' y 'Modificacion'
+   │
+   ├─ historico.ts itera día por día desde la última fecha descargada
+   │  │
+   │  └─ Para cada día: GET /profesional/buscar → Guarda en caché
+   │
+   └─ Los datos se guardan en: cache/sisa.msal.gov.ar/...
+
+2. DATASETS (Procesamiento)
+   │
+   ├─ index.ts ejecuta fromCacheSisa() para ambos modos
+   │
+   ├─ historico.ts lee archivos del caché día por día
+   │  │
+   │  ├─ Convierte XML → JSON
+   │  ├─ Simplifica estructura
+   │  ├─ Parsea cada profesional con parseProfesional()
+   │  └─ Guarda en Map<string, Profesional>
+   │
+   ├─ index.ts mergea ambos Maps
+   │  │
+   │  ├─ Elimina duplicados (mantiene más reciente)
+   │  ├─ Mergea matrículas y especialidades
+   │  └─ Genera archivos finales:
+   │     ├─ professionals-merged.json
+   │     └─ professionals-merged.csv
+   │
+   └─ Los archivos finales están en: src/datasets/sisa.msal.gov.ar/out/
 ```
 
-**Tipo de retorno:** `[Set<string> | undefined, string[] | undefined][]`
+---
 
-### Paso 5: Mapear Cada Momento a sus Datos
+## 📁 Estructura de Archivos de Salida
 
-```typescript
-(moment: Date): [Set<string> | undefined, string[] | undefined] => [
-  entry.atcCodes.lookup(moment),
-  entry.components.lookup(moment)?.map(({ drug }: AlfaBetaComponent): string => drug),
-]
+### Archivos Intermedios (en `out/`):
+- `sisa-profesionales.json`: Profesionales del modo "Registro"
+- `sisa-profesionales-modificacion.json`: Profesionales del modo "Modificación"
+
+### Archivos Finales (en `out/`):
+- `professionals-merged.json`: JSON con todos los profesionales mergeados
+- `professionals-merged.csv`: CSV con todos los profesionales mergeados (estructura aplanada)
+
+---
+
+## 🔐 Variables de Entorno Requeridas
+
+```bash
+SISA_API=https://sisa.msal.gov.ar/sisa/services/rest
+SISA_USER=tu_usuario
+SISA_PASSWORD=tu_contraseña
 ```
 
-**¿Qué hace?**
-- Para cada momento (fecha), busca:
-  1. Los códigos ATC en esa fecha: `entry.atcCodes.lookup(moment)` → `Set<string> | undefined`
-  2. Los componentes en esa fecha: `entry.components.lookup(moment)` → `AlfaBetaComponent[] | undefined`
-- Extrae solo el nombre de la droga de cada componente: `.map(({ drug }) => drug)`
+---
 
-**Ejemplo:**
-```typescript
-// Para un momento específico:
-// entry.atcCodes.lookup(moment) → Set(["A01AA01", "A01AA02"])
-// entry.components.lookup(moment) → [
-//   { drug: "Paracetamol", ... },
-//   { drug: "Ibuprofeno", ... }
-// ]
+## ⚠️ Consideraciones Importantes
 
-// Después del map:
-// ["Paracetamol", "Ibuprofeno"]
+1. **Cuota Diaria**: La API de SISA tiene una cuota diaria limitada. Si se excede, el sistema detiene la descarga automáticamente.
 
-// Resultado de la tupla:
-// [Set(["A01AA01", "A01AA02"]), ["Paracetamol", "Ibuprofeno"]]
-```
+2. **Caché**: El sistema usa caché para evitar descargas duplicadas. Los archivos se guardan en `cache/sisa.msal.gov.ar/`.
 
-**Tipo de retorno:** `[Set<string> | undefined, string[] | undefined][]`
+3. **Reanudación**: Si se interrumpe una descarga, el sistema reanuda desde la última fecha descargada automáticamente.
 
-### Paso 6: Filtrar Pares Válidos
+4. **Duplicados**: El sistema elimina duplicados inteligentemente, manteniendo siempre la versión más reciente basándose en fechas de modificación, registro y certificación.
 
-```typescript
-.filter(
-  (pair: [Set<string> | undefined, string[] | undefined]): pair is [Set<string>, string[]] =>
-    undefined !== pair[0] && undefined !== pair[1] && 0 < pair[0].size && 0 < pair[1].length,
-)
-```
+5. **Formato de Fechas**: La API de SISA usa diferentes formatos de fecha:
+   - `DD/MM/YYYY` para fechas simples
+   - `DD-MM-YYYY` para fechas con guiones
+   - `DD-MM-YYYY HH:mm` para fechas con hora
 
-**¿Qué hace?**
-- Elimina pares donde:
-  - Los códigos ATC son `undefined`
-  - Los componentes son `undefined`
-  - Los códigos ATC están vacíos (`size === 0`)
-  - Los componentes están vacíos (`length === 0`)
-- Usa un type guard para asegurar que después del filtro, ambos valores están definidos
+6. **XML a JSON**: Los datos vienen en XML desde la API, pero se convierten a JSON para facilitar el procesamiento.
 
-**Ejemplo:**
-```typescript
-// Antes del filter:
-[
-  [Set(["A01AA01"]), ["Paracetamol"]],  // ✅ Válido
-  [undefined, ["Ibuprofeno"]],            // ❌ Filtrado (ATC undefined)
-  [Set([]), ["Aspirina"]],                // ❌ Filtrado (ATC vacío)
-  [Set(["A01AA02"]), []],                 // ❌ Filtrado (componentes vacíos)
-  [Set(["A01AA03"]), ["Diclofenac"]]      // ✅ Válido
-]
+---
 
-// Después del filter:
-[
-  [Set(["A01AA01"]), ["Paracetamol"]],
-  [Set(["A01AA03"]), ["Diclofenac"]]
-]
-```
+## 🎯 Casos de Uso
 
-**Tipo de retorno:** `[Set<string>, string[]][]` (solo pares válidos)
-
-### Paso 7: `flatMap` para Generar Combinaciones
-
-```typescript
-.flatMap(([atcCodes, components]: [Set<string>, string[]]): [string, string][] => {
-  const normalizedAtcCodes: string[] = Array.from(atcCodes.values(), (atcCode: string): string =>
-    atcCode.toUpperCase(),
-  );
-  return array_cartesian(components, normalizedAtcCodes);
-})
-```
-
-**¿Qué hace?**
-1. **Normaliza códigos ATC**: Convierte todos los códigos ATC a mayúsculas
-2. **Genera producto cartesiano**: Crea todas las combinaciones posibles entre componentes y códigos ATC
-
-**¿Qué es `array_cartesian`?**
-```typescript
-array_cartesian(components, normalizedAtcCodes)
-// Si components = ["Paracetamol", "Ibuprofeno"]
-// Y normalizedAtcCodes = ["A01AA01", "A01AA02"]
-// Resultado:
-[
-  ["Paracetamol", "A01AA01"],
-  ["Paracetamol", "A01AA02"],
-  ["Ibuprofeno", "A01AA01"],
-  ["Ibuprofeno", "A01AA02"]
-]
-```
-
-**Ejemplo completo:**
-```typescript
-// Entrada:
-[Set(["a01aa01", "A01AA02"]), ["Paracetamol", "Ibuprofeno"]]
-
-// Paso 1: Normalizar ATC
-normalizedAtcCodes = ["A01AA01", "A01AA02"]
-
-// Paso 2: Producto cartesiano
-[
-  ["Paracetamol", "A01AA01"],
-  ["Paracetamol", "A01AA02"],
-  ["Ibuprofeno", "A01AA01"],
-  ["Ibuprofeno", "A01AA02"]
-]
-```
-
-**Tipo de retorno:** `[string, string][]` (array de tuplas [componente, códigoATC])
-
-### Paso 8: `array_categorize` - Agrupar por Componente
-
-```typescript
-array_categorize(
-  [...todas las tuplas [string, string]...],
-  ([drug]: [string, string]): string => drug,
-)
-```
-
-**¿Qué hace `array_categorize`?**
-- Toma un array y una función categorizadora
-- Agrupa los elementos del array por la categoría que devuelve la función
-- Devuelve un `Map` donde:
-  - **Clave**: La categoría (en este caso, el nombre del componente)
-  - **Valor**: Array de todos los elementos que pertenecen a esa categoría
-
-**Ejemplo:**
-```typescript
-// Entrada (array de tuplas):
-[
-  ["Paracetamol", "A01AA01"],
-  ["Paracetamol", "A01AA02"],
-  ["Ibuprofeno", "A01AA01"],
-  ["Ibuprofeno", "A01AA02"],
-  ["Paracetamol", "A01AA03"]
-]
-
-// Después de array_categorize:
-Map {
-  "Paracetamol" => [
-    ["Paracetamol", "A01AA01"],
-    ["Paracetamol", "A01AA02"],
-    ["Paracetamol", "A01AA03"]
-  ],
-  "Ibuprofeno" => [
-    ["Ibuprofeno", "A01AA01"],
-    ["Ibuprofeno", "A01AA02"]
-  ]
-}
-```
-
-**Tipo de retorno:** `Map<string, [string, string][]>`
-
-### Paso 9: `map_map` - Transformar Arrays en Sets
-
-```typescript
-map_map(
-  Map<string, [string, string][]>,
-  (pairs: [string, string][]): Set<string> =>
-    new Set<string>(pairs.map(([, atcCode]: [string, string]): string => atcCode)),
-)
-```
-
-**¿Qué hace `map_map`?**
-- Toma un `Map<K, V>` y una función `f: (v: V) => U`
-- Transforma cada valor del mapa aplicando la función
-- Mantiene las mismas claves
-- Devuelve un `Map<K, U>`
-
-**En este caso:**
-- **Entrada**: `Map<string, [string, string][]>` (componente → array de tuplas)
-- **Función**: Extrae solo los códigos ATC de cada tupla y los convierte en un `Set`
-- **Salida**: `Map<string, Set<string>>` (componente → set de códigos ATC)
-
-**Ejemplo:**
-```typescript
-// Entrada:
-Map {
-  "Paracetamol" => [
-    ["Paracetamol", "A01AA01"],
-    ["Paracetamol", "A01AA02"],
-    ["Paracetamol", "A01AA03"]
-  ],
-  "Ibuprofeno" => [
-    ["Ibuprofeno", "A01AA01"],
-    ["Ibuprofeno", "A01AA02"]
-  ]
-}
-
-// Para "Paracetamol":
-pairs.map(([, atcCode]) => atcCode)
-// → ["A01AA01", "A01AA02", "A01AA03"]
-// new Set(...) → Set(["A01AA01", "A01AA02", "A01AA03"])
-
-// Resultado final:
-Map {
-  "Paracetamol" => Set(["A01AA01", "A01AA02", "A01AA03"]),
-  "Ibuprofeno" => Set(["A01AA01", "A01AA02"])
-}
-```
-
-**Tipo de retorno:** `Map<string, Set<string>>`
-
-## Resumen del Flujo Completo
-
-```
-1. registry.getAllKeys()
-   → [1, 2, 3, ...] (números)
-
-2. .flatMap(key => ...)
-   → Para cada producto, genera tuplas [componente, ATC]
-   → Resultado: [["Paracetamol", "A01AA01"], ["Paracetamol", "A01AA02"], ...]
-
-3. array_categorize(..., drug => drug)
-   → Agrupa por componente
-   → Resultado: Map { "Paracetamol" => [[...tuplas...]], ... }
-
-4. map_map(..., pairs => Set de ATCs)
-   → Convierte arrays de tuplas en Sets de códigos ATC
-   → Resultado: Map { "Paracetamol" => Set(["A01AA01", ...]), ... }
-```
-
-## Funciones Auxiliares Utilizadas
-
-### `flatMap`
-- **Propósito**: Aplana arrays anidados
-- **Ejemplo**: `[1, 2].flatMap(x => [x, x*2])` → `[1, 2, 2, 4]`
-
-### `array_cartesian`
-- **Propósito**: Genera el producto cartesiano de dos arrays
-- **Implementación**: `arrayA.flatMap(a => arrayB.map(b => [a, b]))`
-- **Ejemplo**: `array_cartesian([1, 2], [3, 4])` → `[[1, 3], [1, 4], [2, 3], [2, 4]]`
-
-### `array_categorize`
-- **Propósito**: Agrupa elementos de un array por categoría
-- **Implementación**: Itera sobre el array y agrupa en un Map
-- **Ejemplo**: `array_categorize([1, 2, 3, 4], x => x % 2)` → `Map { 0 => [2, 4], 1 => [1, 3] }`
-
-### `map_map`
-- **Propósito**: Transforma los valores de un Map
-- **Implementación**: `new Map(Array.from(map.entries(), ([k, v]) => [k, f(v)]))`
-- **Ejemplo**: `map_map(Map { "a" => 1, "b" => 2 }, x => x * 2)` → `Map { "a" => 2, "b" => 4 }`
-
-## Resultado Final
-
-El resultado es un `Map<string, Set<string>>` donde:
-- Cada clave es el nombre de un componente (droga)
-- Cada valor es un Set de códigos ATC asociados a ese componente
-- Los códigos ATC están normalizados (mayúsculas)
-- Un componente puede tener múltiples códigos ATC (porque puede aparecer en diferentes productos o momentos temporales)
-
-Este mapa se utiliza posteriormente para traducir nombres de componentes a sus códigos ATC correspondientes.
-
+- **Descarga completa histórica**: Ejecutar `datasources/sisa.msal.gov.ar/index.ts` para descargar todos los datos desde 2010
+- **Consulta individual**: Usar `datasources/sisa.msal.gov.ar/nominal.ts` o `datasets/sisa.msal.gov.ar/nominal.ts` para consultar un profesional específico
+- **Procesamiento y análisis**: Ejecutar `datasets/sisa.msal.gov.ar/index.ts` para generar los archivos finales procesados
